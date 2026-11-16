@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, onTestFinished, test } from 'vite-plus/test';
-import type { JevOptions, JevRequest, JevRule } from '../src/types.ts';
+import type { DecisionRequest, JevOptions, JevRule } from '../src/types.ts';
 import { startMockJev } from './mock-jev.ts';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -44,12 +44,12 @@ async function project(text = source, options: Partial<JevOptions> = {}, token =
   );
   return {
     cwd,
-    requests: (): JevRequest[] =>
+    requests: (): DecisionRequest[] =>
       readFileSync(logPath, 'utf8')
         .trim()
         .split('\n')
         .filter(Boolean)
-        .map((line) => (JSON.parse(line) as { body: JevRequest }).body),
+        .map((line) => (JSON.parse(line) as { body: DecisionRequest }).body),
     lint() {
       const result = spawnSync(
         oxlintBin,
@@ -103,7 +103,7 @@ test('keeps the request and location unchanged without a location question', asy
   const fixture = await project(source, { rules: [withoutLocation] });
   expect(fixture.lint().diagnostics[0].labels[0].span.line).toBe(1);
   expect(fixture.requests()[0].state.snippets.s0).toBe(source);
-  expect(Object.keys(fixture.requests()[0].questions)).toEqual(['s0']);
+  expect(Object.keys(fixture.requests()[0].questions)).toEqual(['q0']);
 });
 
 test.each(['fail', 'skip'] as const)(
@@ -119,7 +119,7 @@ test.each(['fail', 'skip'] as const)(
       expect(result.status, result.stdout + result.stderr).toBe(1);
       expect(result.diagnostics).toHaveLength(1);
       expect(result.diagnostics[0].labels[0].span.line).toBe(1);
-      expect(Object.keys(fixture.requests()[0].questions)).toEqual(['s0']);
+      expect(Object.keys(fixture.requests()[0].questions)).toEqual(['q0']);
     }
   },
 );
@@ -217,10 +217,11 @@ test('retries malformed refinement answers already on disk', async () => {
   for (const name of readdirSync(cache)) {
     const entryPath = path.join(cache, name);
     const entry = JSON.parse(readFileSync(entryPath, 'utf8')) as {
-      answers: Record<string, unknown>;
+      answer: { type: string; choice?: string };
     };
-    if (!entry.answers.s0) {
-      entry.answers.s0_location = { type: 'choice', choice: 'L604' };
+    // The refinement is the one answer that selects a single line.
+    if (entry.answer.choice === 'L604') {
+      entry.answer = { type: 'choice', choice: 'L604' };
       writeFileSync(entryPath, JSON.stringify(entry));
       corrupted++;
     }

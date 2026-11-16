@@ -159,7 +159,7 @@ test('a missing key outside CI warns and skips', () => {
   expect(jevLines(result), 'nothing is reported without a key').toEqual([]);
 });
 
-test('two files with the same text but different parses are asked about separately', async () => {
+test('two files with the same text but different parses are asked about their own calls', async () => {
   const project = mkdtempSync(path.join(tmpdir(), 'jev-twins-'));
   const { child, logPath, baseURL } = await startMockJev();
   onTestFinished(() => {
@@ -190,13 +190,11 @@ test('two files with the same text but different parses are asked about separate
     env: { ...clean, TYPESAFE_API_KEY: 'test-key', TYPESAFE_BASE_URL: baseURL },
   });
   expect(result.status, `oxlint runs both files\n${result.stdout}${result.stderr}`).toBe(0);
-  const counts = asked(logPath)
-    .map((request) => Object.keys(request.body.questions).length)
-    .sort((a, b) => a - b);
+  const sent = asked(logPath).flatMap((request) => Object.values(request.body.state.snippets));
   expect(
-    counts,
-    'the .js parse sees two calls and the .ts parse sees three, so each file gets its own request',
-  ).toEqual([2, 3]);
+    sent.sort(),
+    'the .js parse sees two calls and the .ts parse sees three; answers are cached per call, so the shared calls are asked once',
+  ).toEqual(['f<T>(x)', 'first()', 'last()']);
 });
 
 test('a file over maxMatchesPerFile is capped and named on stderr', async () => {
@@ -220,7 +218,7 @@ test('a file over maxMatchesPerFile is capped and named on stderr', async () => 
   );
   writeFileSync(
     path.join(project, 'rows.js'),
-    `${Array.from({ length: 30 }, () => 'console.log("row", user.email, user.phone);').join('\n')}\n`,
+    `${Array.from({ length: 30 }, (_, row) => `console.log("row ${row}", user.email, user.phone);`).join('\n')}\n`,
   );
 
   const clean = { ...process.env };
@@ -364,7 +362,7 @@ test('each rule gets its own maxMatchesPerFile budget and cap warning', async ()
         ],
       },
     },
-    { 'rows.js': piiCall.repeat(3) },
+    { 'rows.js': ['a', 'b', 'c'].map((row) => piiCall.replace('row', row)).join('') },
     baseURL,
   );
   const counts = asked(logPath)
@@ -438,7 +436,7 @@ const badConfigs: [string, unknown, string][] = [
   [
     'a plugin-level field is unknown',
     { foo: 1, rules: [goodRule] },
-    'Unexpected property "foo". Expected properties: "ci", "timeoutMs", "maxMatchesPerFile", "maxSnippetChars", "model", "rules".',
+    'Unexpected property "foo". Expected properties: "ci", "timeoutMs", "maxMatchesPerFile", "maxSnippetChars", "model", "longContext", "judge", "changedOnly", "changedBase", "rules".',
   ],
   [
     'two rules share an id',

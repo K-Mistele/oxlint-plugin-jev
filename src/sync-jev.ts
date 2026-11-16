@@ -8,20 +8,20 @@ import type { AskInput, AskResult } from './types.ts';
 const BACKSTOP_MS = 60000;
 const SYNCKIT_TIMEOUT = 'Internal error: Atomics.wait() failed: timed-out';
 
-type JevWorker = (input: AskInput) => Promise<AskResult>;
+type ModelWorker = (input: AskInput) => Promise<AskResult>;
 
-let call: Syncify<JevWorker> | null = null;
+let call: Syncify<ModelWorker> | null = null;
 
-function jevCall(): Syncify<JevWorker> {
-  call ??= createSyncFn<JevWorker>(fileURLToPath(new URL('./worker.mjs', import.meta.url)), {
+function workerCall(): Syncify<ModelWorker> {
+  call ??= createSyncFn<ModelWorker>(fileURLToPath(new URL('./worker.mjs', import.meta.url)), {
     timeout: BACKSTOP_MS,
   });
   return call;
 }
 
-export function askJev(input: AskInput): AskResult {
+export function askModel(input: AskInput): AskResult {
   try {
-    return jevCall()(input);
+    return workerCall()(input);
   } catch (error) {
     const message = messageOf(error);
     if (message === SYNCKIT_TIMEOUT) return { ok: false, reason: 'timeout' };

@@ -1,14 +1,15 @@
 import { expect, test } from 'vite-plus/test';
 import {
   buildRequest,
-  cacheKey,
-  choiceQuestionsOf,
+  isValidAnswer,
+  locationAsk,
   locationCandidates,
-  parseVerdicts,
+  probabilityOf,
   selectedLocation,
   truncateSnippet,
+  verdictAsk,
 } from '../src/jev.ts';
-import type { JevRule, RequestMatch } from '../src/types.ts';
+import type { ChoiceQuestion, JevRule, RequestMatch } from '../src/types.ts';
 
 const secretRule: JevRule = {
   id: 'no-secret-logging',
@@ -26,35 +27,47 @@ const matches: RequestMatch[] = [
   { rule: secretRule, snippet: 'console.log("token", process.env.API_TOKEN)' },
   { rule: swallowRule, snippet: 'function f() { try { g() } catch {} }' },
 ];
+const backend = 'typesafe https://api.typesafe.ai/v1 jev-latest';
+const verdicts = (list: readonly RequestMatch[]) => list.map((match) => verdictAsk(backend, match));
 
-test('builds the request body documented in the README', () => {
-  expect(buildRequest('jev-latest', matches)).toEqual({
-    model: 'jev-latest',
-    state: {
-      snippets: {
-        s0: 'console.log("token", process.env.API_TOKEN)',
-        s1: 'function f() { try { g() } catch {} }',
+test('builds the request body the AI SDK decision API takes', () => {
+  expect(buildRequest(verdicts(matches))).toEqual({
+    request: {
+      state: {
+        snippets: {
+          s0: 'console.log("token", process.env.API_TOKEN)',
+          s1: 'function f() { try { g() } catch {} }',
+        },
+      },
+      questions: {
+        q0: {
+          type: 'boolean',
+          instructions:
+            'Consider only snippet "s0" in state.snippets. Does this call print, log, or send a password, token, secret, or API key?',
+        },
+        q1: {
+          type: 'boolean',
+          instructions:
+            'Consider only snippet "s1" in state.snippets. Does this function swallow an error silently?',
+        },
       },
     },
-    questions: {
-      s0: {
-        type: 'noul',
-        instructions:
-          'Consider only snippet "s0" in state.snippets. Does this call print, log, or send a password, token, secret, or API key?',
-      },
-      s1: {
-        type: 'noul',
-        instructions:
-          'Consider only snippet "s1" in state.snippets. Does this function swallow an error silently?',
-      },
-    },
+    ids: ['q0', 'q1'],
   });
 });
 
-test('numbers refs in match order', () => {
-  const body = buildRequest('jev-latest', [...matches, { rule: secretRule, snippet: 'third()' }]);
-  expect(Object.keys(body.questions)).toEqual(['s0', 's1', 's2']);
-  expect(body.state.snippets.s2).toBe('third()');
+test('sends a snippet shared by two questions once', () => {
+  const shared = { rule: swallowRule, snippet: matches[0].snippet };
+  const { request } = buildRequest(verdicts([matches[0], shared]));
+  expect(Object.keys(request.state.snippets)).toEqual(['s0']);
+  expect(Object.keys(request.questions)).toEqual(['q0', 'q1']);
+  expect(request.questions.q1.instructions).toContain('snippet "s0"');
+});
+
+test('asks an identical question about an identical snippet once', () => {
+  const { request, ids } = buildRequest(verdicts([matches[0], { ...matches[0] }]));
+  expect(Object.keys(request.questions)).toEqual(['q0']);
+  expect(ids).toEqual(['q0', 'q0']);
 });
 
 test('leaves a snippet at the limit untouched', () => {
@@ -65,164 +78,97 @@ test('marks a snippet past the limit as truncated', () => {
   expect(truncateSnippet('abcdef', 5)).toBe('abcde/* ...truncated */');
 });
 
-const model = 'jev-1.13.0';
-
-test('reads a verdict per ref', () => {
-  const json = {
-    model,
-    answers: { s0: { type: 'noul', noul: 0.93 }, s1: { type: 'noul', noul: 0.12 } },
-  };
-  expect(parseVerdicts(json, ['s0', 's1'])).toEqual({
-    model,
-    scores: { s0: 0.93, s1: 0.12 },
-    answers: json.answers,
-    complete: true,
-  });
+test.each([0, 0.4, 1])('reads a boolean probability of %s', (probability) => {
+  expect(probabilityOf({ type: 'boolean', probability })).toBe(probability);
 });
 
-test('ignores answers for refs that were not asked', () => {
-  const json = { model, answers: { s0: { noul: 0.4 }, s9: { noul: 0.9 } } };
-  expect(parseVerdicts(json, ['s0'])).toEqual({
-    model,
-    scores: { s0: 0.4 },
-    answers: json.answers,
-    complete: true,
-  });
+test.each([
+  undefined,
+  null,
+  0.4,
+  { type: 'noul', noul: 0.4 },
+  { type: 'boolean' },
+  { type: 'boolean', probability: '0.4' },
+  { type: 'boolean', probability: Number.NaN },
+  { type: 'boolean', probability: -0.01 },
+  { type: 'boolean', probability: 1.01 },
+])('refuses a verdict that is not a probability in [0, 1] (%j)', (answer) => {
+  expect(probabilityOf(answer)).toBe(null);
+  expect(isValidAnswer(verdictAsk(backend, matches[0]), answer)).toBe(false);
 });
 
-const badResponses: [string, unknown, RegExp][] = [
-  ['there is no model id', { answers: { s0: { noul: 0.4 } } }, /response has no model id/],
-  [
-    'the model id is empty',
-    { model: '', answers: { s0: { noul: 0.4 } } },
-    /response has no model id/,
-  ],
-  ['the model id is not a string', { model: 1, answers: {} }, /response has no model id/],
-  ['there is no answers object', { model }, /response has no answers object/],
-  ['answers is not an object', { model, answers: 'yes' }, /response has no answers object/],
-  ['answers is an array', { model, answers: [] }, /response has no answers object/],
-  [
-    'a ref is missing',
-    { model, answers: { s0: { noul: 0.4 } } },
-    /no probability in \[0, 1\] for "s1"/,
-  ],
-  [
-    'a noul is a string',
-    { model, answers: { s0: { noul: 0.4 }, s1: { noul: '0.9' } } },
-    /no probability in \[0, 1\] for "s1"/,
-  ],
-  [
-    'a noul is NaN',
-    { model, answers: { s0: { noul: 0.4 }, s1: { noul: Number.NaN } } },
-    /no probability in \[0, 1\] for "s1"/,
-  ],
-  [
-    'a noul is below 0',
-    { model, answers: { s0: { noul: 0.4 }, s1: { noul: -0.01 } } },
-    /no probability in \[0, 1\] for "s1"/,
-  ],
-  [
-    'a noul is above 1',
-    { model, answers: { s0: { noul: 0.4 }, s1: { noul: 1.01 } } },
-    /no probability in \[0, 1\] for "s1"/,
-  ],
-];
-
-for (const [name, json, message] of badResponses) {
-  test(`refuses a response where ${name}`, () => {
-    expect(() => parseVerdicts(json, ['s0', 's1'])).toThrow(message);
-  });
-}
-
-test('accepts the boundaries 0 and 1', () => {
-  const json = { model, answers: { s0: { noul: 0 }, s1: { noul: 1 } } };
-  expect(parseVerdicts(json, ['s0', 's1'])).toEqual({
-    model,
-    scores: { s0: 0, s1: 1 },
-    answers: json.answers,
-    complete: true,
-  });
-});
-
-const endpoint = 'https://api.typesafe.ai';
-const request = buildRequest('jev-latest', matches);
-const keyInput = { endpoint, request };
+const keyOf = (match: RequestMatch, on = backend) => verdictAsk(on, match).key;
 
 test('hashes to a stable sha256 hex digest', () => {
-  const key = cacheKey(keyInput);
-  expect(key).toMatch(/^[0-9a-f]{64}$/);
-  expect(key).toBe(cacheKey({ endpoint, request: buildRequest('jev-latest', matches) }));
+  expect(keyOf(matches[0])).toMatch(/^[0-9a-f]{64}$/);
+  expect(keyOf(matches[0])).toBe(keyOf({ ...matches[0] }));
 });
 
-const keyEdits: [string, { endpoint?: string; request?: typeof request }][] = [
-  ['the model changes', { request: buildRequest('jev-1', matches) }],
+const keyEdits: [string, string][] = [
+  ['the model changes', keyOf(matches[0], 'typesafe https://api.typesafe.ai/v1 jev-1.13.0')],
+  ['the backend changes', keyOf(matches[0], 'gateway typesafe-ai/jev')],
+  ['the snippet changes', keyOf({ ...matches[0], snippet: 'console.log(2)' })],
   [
-    'a snippet changes',
-    {
-      request: buildRequest('jev-latest', [
-        { ...matches[0], snippet: 'console.log(2)' },
-        matches[1],
-      ]),
-    },
+    'the question changes',
+    keyOf({ ...matches[0], rule: { ...secretRule, question: 'Something else?' } }),
   ],
-  [
-    'a question changes',
-    {
-      request: buildRequest('jev-latest', [
-        { ...matches[0], rule: { ...secretRule, question: 'Something else?' } },
-        matches[1],
-      ]),
-    },
-  ],
-  ['two matches swap order', { request: buildRequest('jev-latest', [matches[1], matches[0]]) }],
-  ['the endpoint changes', { endpoint: 'http://127.0.0.1:9' }],
 ];
 
-for (const [name, edit] of keyEdits) {
-  test(`invalidates the key when ${name}`, () => {
-    expect(cacheKey({ ...keyInput, ...edit })).not.toBe(cacheKey(keyInput));
+for (const [name, key] of keyEdits) {
+  test(`invalidates a cached answer when ${name}`, () => {
+    expect(key).not.toBe(keyOf(matches[0]));
   });
 }
-
-test('keys on the request alone, so an edit outside every snippet reuses the entry', () => {
-  const rematched = matches.map((match) => ({
-    ...match,
-    loc: { start: { line: 99, column: 0 }, end: { line: 99, column: 0 } },
-  }));
-  expect(cacheKey({ endpoint, request: buildRequest('jev-latest', rematched) })).toBe(
-    cacheKey(keyInput),
-  );
-});
 
 const verdictNeutralEdits: [string, JevRule][] = [
   ['a cutoff changes', { ...secretRule, cutoff: 0.81 }],
   ['a rule id changes', { ...secretRule, id: 'renamed' }],
+  ['a message changes', { ...secretRule, message: 'Do not log secrets.' }],
 ];
 
 for (const [name, rule] of verdictNeutralEdits) {
-  test(`keeps the key when ${name}, since verdicts do not depend on it`, () => {
-    const edited = buildRequest('jev-latest', [{ ...matches[0], rule }, matches[1]]);
-    expect(cacheKey({ endpoint, request: edited })).toBe(cacheKey(keyInput));
+  test(`keeps the answer when ${name}, since verdicts do not depend on it`, () => {
+    expect(keyOf({ ...matches[0], rule })).toBe(keyOf(matches[0]));
   });
 }
 
-const locationMatch: RequestMatch = {
+test('keys each match on its own, so a neighbour or its position does not matter', () => {
+  const alone = buildRequest(verdicts([matches[1]]));
+  const after = buildRequest(verdicts([matches[0], matches[1]]));
+  expect(verdictAsk(backend, matches[1]).key).toBe(verdicts([matches[0], matches[1]])[1].key);
+  expect(alone.request.questions.q0.instructions).not.toBe(after.request.questions.q1.instructions);
+});
+
+const locationMatch = {
   rule: {
     question: 'Does this file log a secret?',
     location: { question: 'Select the logging call.', cutoff: 0.75 },
   },
   snippet: '// Context\n\nconsole.log(secret);\n',
 };
-const locationRequest = buildRequest('jev-latest', [locationMatch]);
-const choices = choiceQuestionsOf(locationRequest);
+const located = locationAsk(backend, locationMatch);
+const criteria = (located.question('s0') as ChoiceQuestion).criteria;
+
+test('numbers the source a location question reads', () => {
+  const { request } = buildRequest([verdictAsk(backend, locationMatch), located]);
+  expect(request.state.snippets).toEqual({
+    s0: 'L1| // Context\nL2| \nL3| console.log(secret);\nL4| ',
+  });
+  expect(Object.keys(request.questions)).toEqual(['q0', 'q1']);
+  expect(request.questions.q1.type).toBe('choice');
+});
 
 test('offers only nonblank source lines and an unknown location', () => {
-  expect(Object.keys(choices.s0_location)).toEqual(['L1', 'L3', 'unknown']);
+  expect(Object.keys(criteria)).toEqual(['L1', 'L3', 'unknown']);
 });
 
 test('an empty file offers only an unknown location', () => {
-  const empty = buildRequest('jev-latest', [{ ...locationMatch, snippet: ' \n\t' }]);
-  expect(Object.keys(choiceQuestionsOf(empty).s0_location)).toEqual(['unknown']);
+  const empty = locationAsk(backend, { ...locationMatch, snippet: ' \n\t' });
+  expect(Object.keys((empty.question('s0') as ChoiceQuestion).criteria)).toEqual(['unknown']);
+});
+
+test('a refinement is cached apart from the first location question', () => {
+  expect(locationAsk(backend, locationMatch, { start: 1, end: 3 }).key).not.toBe(located.key);
 });
 
 test.each([254, 255, 70000])(
@@ -245,7 +191,7 @@ const malformedChoices: unknown[] = [
   undefined,
   null,
   'L3',
-  { type: 'noul', noul: 0.99 },
+  { type: 'boolean', probability: 0.99 },
   { type: 'choice', choice: 'L3' },
   { type: 'choice', choice: 3, probabilities: { 3: 0.99 } },
   { type: 'choice', choice: 'L2', probabilities: { L2: 0.99 } },
@@ -256,30 +202,23 @@ const malformedChoices: unknown[] = [
   })),
 ];
 
-test.each(malformedChoices)(
-  'preserves violation scores but rejects a malformed location (%j)',
-  (answer) => {
-    const json = { model, answers: { s0: { noul: 0.99 }, s0_location: answer } };
-    const verdicts = parseVerdicts(json, ['s0'], choices);
-    expect(verdicts.scores).toEqual({ s0: 0.99 });
-    expect(verdicts.complete).toBe(false);
-    expect(selectedLocation(answer, locationCandidates(locationMatch.snippet), 0.75)).toBe(null);
-  },
-);
+test.each(malformedChoices)('rejects a malformed location (%j)', (answer) => {
+  expect(isValidAnswer(located, answer)).toBe(false);
+  expect(selectedLocation(answer, locationCandidates(locationMatch.snippet), 0.75)).toBe(null);
+});
 
 test.each([0, 0.6, 0.75, 1])(
   'accepts a valid probability and locates only above cutoff (%s)',
   (probability) => {
     const answer = { type: 'choice', choice: 'L3', probabilities: { L3: probability } };
-    const verdicts = parseVerdicts({ model, answers: { s0_location: answer } }, [], choices);
-    expect(verdicts.complete).toBe(true);
+    expect(isValidAnswer(located, answer)).toBe(true);
     expect(selectedLocation(answer, locationCandidates(locationMatch.snippet), 0.75)).toEqual(
       probability >= 0.75 ? { start: 3, end: 3 } : null,
     );
   },
 );
 
-test('changing only a location cutoff reuses the same request', () => {
+test('changing only a location cutoff reuses the same answer', () => {
   const changed = {
     ...locationMatch,
     rule: {
@@ -287,5 +226,5 @@ test('changing only a location cutoff reuses the same request', () => {
       location: { question: 'Select the logging call.', cutoff: 0.9 },
     },
   };
-  expect(buildRequest('jev-latest', [changed])).toEqual(locationRequest);
+  expect(locationAsk(backend, changed).key).toBe(located.key);
 });
