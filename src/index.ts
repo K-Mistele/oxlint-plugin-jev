@@ -3,46 +3,55 @@ import type {
   ESTree,
   Location,
   Plugin,
+  Rule,
   RuleMeta,
   SourceCode,
   VisitorWithHooks,
 } from '@oxlint/plugins';
-import { ENV } from '@typesafe-ai/sdk';
-import { defaultCacheDir, readCache, writeCache } from './cache.ts';
+import { answerAll, type AnswersResult } from './answers.ts';
+import { backendFor } from './backend.ts';
+import { defaultCacheDir } from './cache.ts';
+import { changedLines, changedMode, overlaps, type ChangedLines } from './changed.ts';
 import {
-  buildRequest,
-  cacheKey,
-  choiceQuestionsOf,
   locates,
+  locationAsk,
   locationCandidates,
   locationOfLine,
-  locationQuestion,
-  messageOf,
-  parseVerdicts,
-  refAt,
+  probabilityOf,
   selectedLocation,
   truncateSnippet,
+  verdictAsk,
+  type Ask,
 } from './jev.ts';
 import {
   checkOptions,
+  checkPluginOptions,
   DEFAULTS,
   REPORT_LOC,
   SCHEMA,
   snippetNodeFor,
   TARGET_NODE_TYPES,
 } from './options.ts';
-import { askJev } from './sync-jev.ts';
 import type {
+  Backend,
   JevPlugin,
-  JevRequest,
+  JevPluginOptions,
   JevRule,
+  JevRulesPlugin,
   Match,
   ResolvedOptions,
-  VerdictResult,
-  Verdicts,
 } from './types.ts';
 
-export type { CiBehavior, JevOptions, JevPlugin, JevRule, Target } from './types.ts';
+export type {
+  CiBehavior,
+  JevOptions,
+  JevPlugin,
+  JevPluginOptions,
+  JevRule,
+  JevRulesPlugin,
+  JudgeOptions,
+  Target,
+} from './types.ts';
 
 const optionsByRaw = new WeakMap<object, ResolvedOptions>();
 const warnedReasons = new Set<string>();
@@ -53,11 +62,6 @@ function warnOnce(reason: string, message: string): void {
   warnedReasons.add(reason);
   console.warn(`oxlint-plugin-jev: ${message}`);
 }
-
-const DEFAULT_BASE_URL = 'https://api.typesafe.ai';
-
-const baseURL = (): string =>
-  ((process.env[ENV.baseURL] ?? '').trim() || DEFAULT_BASE_URL).replace(/\/+$/, '');
 
 const snippetOf = (sourceCode: SourceCode, node: ESTree.Node): string =>
   node.type === 'Program' ? sourceCode.text : sourceCode.getText(node);
@@ -81,59 +85,123 @@ function rulesByNodeType(rules: readonly JevRule[]): Map<string, JevRule[]> {
   return byType;
 }
 
-function degrade(context: Context, options: ResolvedOptions, reason: string): null {
+const byTypeByRules = new WeakMap<readonly JevRule[], Map<string, JevRule[]>>();
+
+function nodeTypeIndex(rules: readonly JevRule[]): Map<string, JevRule[]> {
+  const cached = byTypeByRules.get(rules);
+  if (cached !== undefined) return cached;
+  const byType = rulesByNodeType(rules);
+  byTypeByRules.set(rules, byType);
+  return byType;
+}
+
+/** An oxlint rule that collects matches for its group and reports its own. */
+interface Member {
+  options(context: Context): ResolvedOptions;
+  rules(options: ResolvedOptions): readonly JevRule[];
+}
+
+interface MatchAsks {
+  readonly verdict: Ask;
+  readonly location?: Ask;
+}
+
+interface Pass {
+  readonly filename: string;
+  readonly options: ResolvedOptions;
+  readonly backend: Backend;
+  readonly backendId: string;
+  readonly changed: ChangedLines | null;
+  readonly matches: Match[];
+  dropped: number;
+  outcome: AnswersResult | null;
+  asks: MatchAsks[];
+  deadline: number;
+  refinementFailed: boolean;
+  failureRaised: boolean;
+}
+
+/**
+ * Rules in one group share one request per file. Oxlint merges every enabled rule's visitor into a
+ * single AST walk and runs `Program:exit` handlers only after the whole walk, so the first
+ * `Program:exit` of a file sees every member's matches and asks once for all of them. `after`
+ * hooks run once the walk is over, even when a rule throws, which is where the pass is cleared.
+ */
+interface Group {
+  /** Names the group in warnings. A shared `jev/ask` group is named by its rule id. */
+  readonly name?: string;
+  pass: Pass | null | 'skip';
+  filename: string;
+}
+
+function degrade(context: Context, options: ResolvedOptions, reason: string): void {
   if (process.env.CI && options.ci === 'fail') {
     throw new Error(`oxlint-plugin-jev: ${reason} (${context.filename})`);
   }
   warnOnce(reason, `${reason} (${context.filename})`);
-  return null;
 }
 
-function fetchVerdicts(
-  options: ResolvedOptions,
-  request: JevRequest,
-  refs: readonly string[],
-  apiKey: string,
-): VerdictResult {
-  const dir = defaultCacheDir();
-  const url = baseURL();
-  const key = cacheKey({ endpoint: url, request });
-  const choices = choiceQuestionsOf(request);
-  const cached = readCache(dir, key, refs, choices);
-  if (cached !== null) return { ok: true, verdicts: cached };
-
-  const result = askJev({ apiKey, baseURL: url, request, timeoutMs: options.timeoutMs });
-  if (!result.ok) return result;
-  let verdicts: Verdicts;
-  try {
-    verdicts = parseVerdicts(result.json, refs, choices);
-  } catch (error) {
-    return { ok: false, reason: messageOf(error) };
-  }
-  if (verdicts.complete) {
-    try {
-      writeCache(dir, key, result.json);
-    } catch (error) {
-      warnOnce('cache-write', `could not write cache in ${dir}: ${messageOf(error)}`);
+function startPass(context: Context, member: Member): Pass | 'skip' {
+  const options = member.options(context);
+  const chosen = backendFor(options);
+  if (!chosen.ok) {
+    if (process.env.CI && options.ci === 'fail') {
+      if (missingKeyRaised) return 'skip';
+      missingKeyRaised = true;
+      throw new Error(`oxlint-plugin-jev: ${chosen.reason}`);
     }
+    warnOnce(`missing-key:${chosen.reason}`, `${chosen.reason}, skipping Jev checks`);
+    return 'skip';
   }
-  return { ok: true, verdicts };
+  let changed: ChangedLines | null = null;
+  const mode = changedMode(options);
+  if (mode.on) {
+    changed = changedLines(context.filename, mode.base, (message) =>
+      warnOnce(`changed:${message}`, message),
+    );
+    if (changed !== 'all' && changed.size === 0) return 'skip';
+  }
+  return {
+    filename: context.filename,
+    options,
+    backend: chosen.backend,
+    backendId: chosen.id,
+    changed,
+    matches: [],
+    dropped: 0,
+    outcome: null,
+    asks: [],
+    deadline: 0,
+    refinementFailed: false,
+    failureRaised: false,
+  };
 }
 
-function verdictsFor(
-  context: Context,
-  options: ResolvedOptions,
-  matches: readonly Match[],
-  apiKey: string,
-  request: JevRequest,
-): Verdicts | null {
-  const result = fetchVerdicts(
-    options,
-    request,
-    matches.map((_, index) => refAt(index)),
-    apiKey,
-  );
-  return result.ok ? result.verdicts : degrade(context, options, result.reason);
+function runBatch(pass: Pass, name: string, filename: string): AnswersResult {
+  const { options } = pass;
+  if (pass.dropped > 0) {
+    const total = pass.matches.length + pass.dropped;
+    warnOnce(
+      `capped:${name}:${filename}`,
+      `${total} matches exceeded maxMatchesPerFile=${options.maxMatchesPerFile}, ${pass.dropped} not checked by ${name} (${filename})`,
+    );
+  }
+  pass.deadline = Date.now() + options.timeoutMs;
+  // An LLM judge answers yes/no questions only, so its file rules stay at the file level.
+  const locating = pass.backend.kind !== 'judge';
+  pass.asks = pass.matches.map((match) => ({
+    verdict: verdictAsk(pass.backendId, match),
+    location: locating && locates(match) ? locationAsk(pass.backendId, match) : undefined,
+  }));
+  return answerAll({
+    asks: pass.asks.flatMap(({ verdict, location }) =>
+      location === undefined ? [verdict] : [verdict, location],
+    ),
+    backend: pass.backend,
+    timeoutMs: options.timeoutMs,
+    cacheDir: defaultCacheDir(),
+    onCacheError: (message) => warnOnce('cache-write', message),
+  });
 }
 
 interface LocatedResult {
@@ -142,77 +210,108 @@ interface LocatedResult {
 }
 
 function locateMatch(
-  options: ResolvedOptions,
+  pass: Pass,
   match: Match,
-  index: number,
-  verdicts: Verdicts,
-  request: JevRequest,
-  apiKey: string,
-  deadline: number,
+  ask: Ask | undefined,
+  answers: Map<string, { answer: unknown }>,
 ): LocatedResult {
-  if (!locates(match)) return { loc: match.loc };
-  const ref = refAt(index);
-  const questionId = `${ref}_location`;
+  if (ask === undefined || !locates(match)) return { loc: match.loc };
+  const { cutoff } = match.rule.location;
   let candidates = locationCandidates(match.snippet);
-  let location = selectedLocation(
-    verdicts.answers[questionId],
-    candidates,
-    match.rule.location.cutoff,
-  );
+  let location = selectedLocation(answers.get(ask.key)?.answer, candidates, cutoff);
   while (location && location.start !== location.end) {
+    const followup = locationAsk(pass.backendId, match, location);
     candidates = locationCandidates(match.snippet, location);
-    const followup = {
-      model: options.model,
-      state: request.state,
-      questions: { [questionId]: locationQuestion(match, ref, candidates) },
-    };
-    const remaining = { ...options, timeoutMs: Math.max(1, deadline - Date.now()) };
-    const refined = fetchVerdicts(remaining, followup, [], apiKey);
+    const refined = answerAll({
+      asks: [followup],
+      backend: pass.backend,
+      timeoutMs: Math.max(1, pass.deadline - Date.now()),
+      cacheDir: defaultCacheDir(),
+      onCacheError: (message) => warnOnce('cache-write', message),
+    });
     if (!refined.ok) return { loc: match.loc, failure: refined.reason };
-    location = selectedLocation(
-      refined.verdicts.answers[questionId],
-      candidates,
-      match.rule.location.cutoff,
-    );
+    location = selectedLocation(refined.answers.get(followup.key)?.answer, candidates, cutoff);
   }
   return { loc: location ? locationOfLine(match.snippet, location.start) : match.loc };
 }
 
-const byTypeByOptions = new WeakMap<ResolvedOptions, Map<string, JevRule[]>>();
-
-function nodeTypeIndex(options: ResolvedOptions): Map<string, JevRule[]> {
-  const cached = byTypeByOptions.get(options);
-  if (cached !== undefined) return cached;
-  const byType = rulesByNodeType(options.rules);
-  byTypeByOptions.set(options, byType);
-  return byType;
+function reportMatches(context: Context, member: Member, pass: Pass, outcome: AnswersResult): void {
+  if (!outcome.ok) return;
+  let failure: { id: string; loc: Location; reason: string } | null = null;
+  for (const [index, match] of pass.matches.entries()) {
+    if (match.owner !== member) continue;
+    const asks = pass.asks[index];
+    const answered = outcome.answers.get(asks.verdict.key);
+    const score = probabilityOf(answered?.answer);
+    if (answered === undefined || score === null || score < match.rule.cutoff) continue;
+    const { id, cutoff, question, message } = match.rule;
+    // Avoid further requests after a failed refinement while preserving every confirmed finding.
+    const located: LocatedResult = pass.refinementFailed
+      ? { loc: match.loc }
+      : locateMatch(pass, match, asks.location, outcome.answers);
+    if (located.failure !== undefined) {
+      pass.refinementFailed = true;
+      failure = { id, loc: match.loc, reason: located.failure };
+    }
+    context.report({
+      loc: located.loc,
+      messageId: message === undefined ? 'yes' : 'custom',
+      data: {
+        id,
+        model: answered.model,
+        score: score.toFixed(2),
+        cutoff: cutoff.toFixed(2),
+        question,
+        message,
+      },
+    });
+  }
+  if (failure === null) return;
+  // Throwing here would discard findings already reported for this file, so fail mode
+  // emits the inference error as a separate diagnostic; skip mode warns as usual.
+  if (process.env.CI && pass.options.ci === 'fail') {
+    context.report({
+      loc: failure.loc,
+      messageId: 'unlocated',
+      data: { id: failure.id, reason: failure.reason },
+    });
+  } else {
+    warnOnce(failure.reason, `${failure.reason} (${context.filename})`);
+  }
 }
 
-interface FilePass {
-  readonly options: ResolvedOptions;
-  readonly apiKey: string;
-  readonly byType: Map<string, JevRule[]>;
-  readonly matches: Match[];
-  dropped: number;
-}
-
-function createOnce(context: Context): VisitorWithHooks {
-  let pass: FilePass | null = null;
+function visitorsFor(
+  group: Group,
+  member: Member,
+  context: Context,
+  nodeTypes: readonly string[],
+): VisitorWithHooks {
+  const activePass = (): Pass | null =>
+    typeof group.pass === 'object' && group.pass?.filename === context.filename ? group.pass : null;
 
   const collect = (type: string, node: ESTree.Node): void => {
+    const pass = activePass();
     if (pass === null) return;
-    const rules = pass.byType.get(type);
+    const rules = nodeTypeIndex(member.rules(pass.options)).get(type);
     if (rules === undefined) return;
     for (const rule of rules) {
+      if (
+        pass.changed !== null &&
+        rule.target !== 'file' &&
+        !overlaps(pass.changed, node.loc.start.line, node.loc.end.line)
+      ) {
+        continue;
+      }
       if (pass.matches.length >= pass.options.maxMatchesPerFile) {
         pass.dropped += 1;
-        return;
+        continue;
       }
       const own = snippetOf(context.sourceCode, node);
       const named = snippetNodeFor(node);
       const text = named === node ? own : context.sourceCode.getText(named);
       pass.matches.push({
         rule,
+        owner: member,
         loc: REPORT_LOC[rule.target](node, own),
         snippet: truncateSnippet(text, pass.options.maxSnippetChars),
         truncated: text.length > pass.options.maxSnippetChars,
@@ -221,100 +320,49 @@ function createOnce(context: Context): VisitorWithHooks {
   };
 
   const visitors: VisitorWithHooks = {};
-  for (const type of Object.values(TARGET_NODE_TYPES).flat()) {
-    visitors[type] = (node) => collect(type, node);
-  }
+  for (const type of nodeTypes) visitors[type] = (node) => collect(type, node);
 
-  // `Program` carries the per-file setup as well as the `file` target, because oxlint does not
-  // guarantee `before` runs for every file.
+  // `Program` carries the per-file setup as well as the `file` target. The first member to enter
+  // a file starts the group's pass; the others join it.
   visitors.Program = (node) => {
-    const options = optionsFor(context.options[0]);
-    const apiKey = (process.env[ENV.apiKey] ?? '').trim();
-    if (apiKey.length === 0) {
-      pass = null;
-      if (process.env.CI && options.ci === 'fail') {
-        if (missingKeyRaised) return;
-        missingKeyRaised = true;
-        throw new Error('oxlint-plugin-jev: TYPESAFE_API_KEY is not set');
-      }
-      warnOnce('missing-key', 'TYPESAFE_API_KEY is not set, skipping Jev checks');
-      return;
+    if (group.pass === null || group.filename !== context.filename) {
+      group.filename = context.filename;
+      group.pass = null;
+      group.pass = startPass(context, member);
     }
-    pass = { options, apiKey, byType: nodeTypeIndex(options), matches: [], dropped: 0 };
     collect('Program', node);
   };
 
   visitors['Program:exit'] = () => {
-    const collected = pass;
-    pass = null;
-    if (collected === null || collected.matches.length === 0) return;
-    if (collected.dropped > 0) {
-      const cap = collected.options.maxMatchesPerFile;
-      const total = collected.matches.length + collected.dropped;
-      warnOnce(
-        `capped:${context.id}:${context.filename}`,
-        `${total} matches exceeded maxMatchesPerFile=${cap}, ${collected.dropped} not checked by ${context.id} (${context.filename})`,
-      );
+    const pass = activePass();
+    if (pass === null) return;
+    pass.outcome ??= runBatch(pass, group.name ?? context.id, context.filename);
+    const outcome = pass.outcome;
+    if (!outcome.ok) {
+      if (pass.failureRaised) return;
+      pass.failureRaised = true;
+      degrade(context, pass.options, outcome.reason);
+      return;
     }
-    const deadline = Date.now() + collected.options.timeoutMs;
-    const request = buildRequest(collected.options.model, collected.matches);
-    const verdicts = verdictsFor(
-      context,
-      collected.options,
-      collected.matches,
-      collected.apiKey,
-      request,
-    );
-    if (verdicts === null) return;
-    let failure: { id: string; loc: Location; reason: string } | null = null;
-    for (const [index, match] of collected.matches.entries()) {
-      const score = verdicts.scores[refAt(index)];
-      if (score >= match.rule.cutoff) {
-        const { id, cutoff, question, message } = match.rule;
-        // Avoid further requests after a failed refinement while preserving every confirmed finding.
-        const located: LocatedResult =
-          failure === null
-            ? locateMatch(
-                collected.options,
-                match,
-                index,
-                verdicts,
-                request,
-                collected.apiKey,
-                deadline,
-              )
-            : { loc: match.loc };
-        if (located.failure !== undefined)
-          failure = { id, loc: match.loc, reason: located.failure };
-        context.report({
-          loc: located.loc,
-          messageId: message === undefined ? 'yes' : 'custom',
-          data: {
-            id,
-            model: verdicts.model,
-            score: score.toFixed(2),
-            cutoff: cutoff.toFixed(2),
-            question,
-            message,
-          },
-        });
-      }
-    }
-    if (failure === null) return;
-    // Throwing here would discard findings already reported for this file, so fail mode
-    // emits the inference error as a separate diagnostic; skip mode warns as usual.
-    if (process.env.CI && collected.options.ci === 'fail') {
-      context.report({
-        loc: failure.loc,
-        messageId: 'unlocated',
-        data: { id: failure.id, reason: failure.reason },
-      });
-    } else {
-      warnOnce(failure.reason, `${failure.reason} (${context.filename})`);
-    }
+    reportMatches(context, member, pass, outcome);
+  };
+
+  visitors.after = () => {
+    group.pass = null;
   };
   return visitors;
 }
+
+const messages = {
+  yes: '[{{id}}] {{model}} answered yes ({{score}} >= {{cutoff}}): {{question}}',
+  custom: '[{{id}}] {{message}} ({{model}} answered yes, {{score}} >= {{cutoff}})',
+  unlocated:
+    'oxlint-plugin-jev: {{reason}} while refining the location of [{{id}}]; the finding is reported at the file level',
+};
+
+const ALL_NODE_TYPES = Object.values(TARGET_NODE_TYPES)
+  .flat()
+  .filter((type) => type !== 'Program');
 
 const meta = {
   type: 'problem',
@@ -324,19 +372,54 @@ const meta = {
   },
   schema: [SCHEMA],
   defaultOptions: [DEFAULTS],
-  messages: {
-    yes: '[{{id}}] {{model}} answered yes ({{score}} >= {{cutoff}}): {{question}}',
-    custom: '[{{id}}] {{message}} ({{model}} answered yes, {{score}} >= {{cutoff}})',
-    unlocated:
-      'oxlint-plugin-jev: {{reason}} while refining the location of [{{id}}]; the finding is reported at the file level',
-  },
+  messages,
 } satisfies RuleMeta;
+
+// Each listed rule is its own group, so `jev/ask` and `jev/suggest` keep separate requests and
+// budgets, as their option lists are configured independently.
+function listRule() {
+  const group: Group = { pass: null, filename: '' };
+  const member: Member = {
+    options: (context) => optionsFor(context.options[0]),
+    rules: (options) => options.rules,
+  };
+  return {
+    meta,
+    createOnce: (context: Context) => visitorsFor(group, member, context, ALL_NODE_TYPES),
+  };
+}
 
 // `suggest` is `ask` under a second name, because a JS plugin cannot choose a report's severity:
 // oxlint takes it from the rule's config entry, so a warn-level rule list needs its own rule.
 const plugin: JevPlugin = {
   meta: { name: 'jev' },
-  rules: { ask: { meta, createOnce }, suggest: { meta, createOnce } },
+  rules: { ask: listRule(), suggest: listRule() },
 } satisfies Plugin;
 
 export default plugin;
+
+/**
+ * Builds an oxlint plugin with one rule per question, named `<name>/<id>`, so each question's
+ * severity and on/off state live in the oxlint config. All of the plugin's enabled rules share one
+ * request per file.
+ */
+export function createJevPlugin(options: JevPluginOptions): JevRulesPlugin {
+  const { name, ...resolved } = checkPluginOptions(options);
+  const group: Group = { name, pass: null, filename: '' };
+  const rules: Record<string, Rule> = {};
+  for (const rule of resolved.rules) {
+    const own = [rule];
+    const member: Member = { options: () => resolved, rules: () => own };
+    const nodeTypes = TARGET_NODE_TYPES[rule.target].filter((type) => type !== 'Program');
+    rules[rule.id] = {
+      meta: {
+        type: 'problem',
+        docs: { description: rule.question },
+        schema: [],
+        messages,
+      } satisfies RuleMeta,
+      createOnce: (context: Context) => visitorsFor(group, member, context, nodeTypes),
+    };
+  }
+  return { meta: { name }, rules } satisfies Plugin;
+}

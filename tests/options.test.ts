@@ -88,6 +88,9 @@ test('defaults the plugin fields the README documents', () => {
     maxMatchesPerFile: 25,
     maxSnippetChars: 4000,
     model: 'jev-latest',
+    longContext: false,
+    changedOnly: false,
+    changedBase: 'HEAD',
   });
 });
 

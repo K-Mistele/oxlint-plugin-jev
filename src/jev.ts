@@ -1,12 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { Location } from '@oxlint/plugins';
-import type { ChoiceQuestion } from '@typesafe-ai/sdk';
-import type { ChoiceQuestions, JevRequest, JevRule, RequestMatch, Verdicts } from './types.ts';
+import type { ChoiceQuestion, DecisionRequest, JevRule, Question, RequestMatch } from './types.ts';
 
 export const messageOf = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
-
-export const refAt = (index: number): string => `s${index}`;
 
 export function truncateSnippet(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars)}/* ...truncated */`;
@@ -23,7 +20,7 @@ export function locates(match: RequestMatch): match is LocatedMatch {
   return Boolean(match.rule.location) && !match.truncated;
 }
 
-interface LineRange {
+export interface LineRange {
   start: number;
   end: number;
 }
@@ -45,19 +42,102 @@ export function locationCandidates(snippet: string, within?: LineRange): Record<
   return candidates;
 }
 
-export function locationQuestion(
-  match: LocatedMatch,
-  ref: string,
-  candidates: Record<string, LineRange>,
-): ChoiceQuestion {
+/** The snippet text as the model reads it: numbered when a location question refers to lines. */
+export function sentSnippet(match: RequestMatch): string {
+  if (!locates(match)) return match.snippet;
+  return sourceLines(match.snippet)
+    .map((text, index) => `L${index + 1}| ${text}`)
+    .join('\n');
+}
+
+/** One question about one snippet, cached on its own. `ref` names the snippet in the request. */
+export interface Ask {
+  readonly key: string;
+  readonly kind: 'verdict' | 'location';
+  readonly snippet: string;
+  readonly criteria?: ChoiceQuestion['criteria'];
+  question(ref: string): Question;
+}
+
+const hash = (payload: unknown): string =>
+  createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+
+// The key holds only what the answer depends on: the backend and model that answer, the question
+// text, and the snippet as sent. Ids, cutoffs, messages, and severities are left out on purpose.
+export function verdictAsk(backend: string, match: RequestMatch): Ask {
+  const snippet = sentSnippet(match);
+  const { question } = match.rule;
   return {
-    type: 'choice',
-    instructions: `Consider only the numbered source in state.snippets.${ref}. If it violates this rule, select the line (or range containing that line) to annotate. Rule: ${match.rule.question} Location: ${match.rule.location.question} If multiple violations exist, select the earliest one. Select unknown if no violation exists or its location is unclear.`,
-    criteria: {
-      ...Object.fromEntries(Object.keys(candidates).map((key) => [key, null])),
-      unknown: 'No clear source location for this violation',
-    },
+    key: hash({ v: 4, backend, kind: 'verdict', question, snippet }),
+    kind: 'verdict',
+    snippet,
+    question: (ref) => ({
+      type: 'boolean',
+      instructions: `Consider only snippet "${ref}" in state.snippets. ${question}`,
+    }),
   };
+}
+
+export function locationAsk(backend: string, match: LocatedMatch, within?: LineRange): Ask {
+  const snippet = sentSnippet(match);
+  const { question, location } = match.rule;
+  const criteria: ChoiceQuestion['criteria'] = {
+    ...Object.fromEntries(
+      Object.keys(locationCandidates(match.snippet, within)).map((key) => [key, null]),
+    ),
+    unknown: 'No clear source location for this violation',
+  };
+  return {
+    key: hash({
+      v: 4,
+      backend,
+      kind: 'location',
+      question,
+      location: location.question,
+      snippet,
+      within: within ?? null,
+    }),
+    kind: 'location',
+    snippet,
+    criteria,
+    question: (ref) => ({
+      type: 'choice',
+      instructions: `Consider only the numbered source in state.snippets.${ref}. If it violates this rule, select the line (or range containing that line) to annotate. Rule: ${question} Location: ${location.question} If multiple violations exist, select the earliest one. Select unknown if no violation exists or its location is unclear.`,
+      criteria,
+    }),
+  };
+}
+
+/** One request for many asks. Identical snippets are sent once and identical asks asked once. */
+export function buildRequest(asks: readonly Ask[]): { request: DecisionRequest; ids: string[] } {
+  const snippets: Record<string, string> = {};
+  const refBySnippet = new Map<string, string>();
+  const questions: DecisionRequest['questions'] = {};
+  const idByKey = new Map<string, string>();
+  const ids = asks.map((ask) => {
+    const existing = idByKey.get(ask.key);
+    if (existing !== undefined) return existing;
+    let ref = refBySnippet.get(ask.snippet);
+    if (ref === undefined) {
+      ref = `s${refBySnippet.size}`;
+      refBySnippet.set(ask.snippet, ref);
+      snippets[ref] = ask.snippet;
+    }
+    const id = `q${idByKey.size}`;
+    idByKey.set(ask.key, id);
+    questions[id] = ask.question(ref);
+    return id;
+  });
+  return { request: { state: { snippets }, questions }, ids };
+}
+
+export function probabilityOf(answer: unknown): number | null {
+  if (typeof answer !== 'object' || answer === null) return null;
+  if (!('type' in answer) || answer.type !== 'boolean' || !('probability' in answer)) return null;
+  const { probability } = answer;
+  return typeof probability === 'number' && probability >= 0 && probability <= 1
+    ? probability
+    : null;
 }
 
 interface ChoiceAnswer {
@@ -66,7 +146,7 @@ interface ChoiceAnswer {
   probabilities: Record<string, number>;
 }
 
-function isChoiceAnswer(
+export function isChoiceAnswer(
   answer: unknown,
   criteria: Record<string, unknown>,
 ): answer is ChoiceAnswer {
@@ -93,6 +173,13 @@ function isChoiceAnswer(
   return typeof probability === 'number' && probability >= 0 && probability <= 1;
 }
 
+/** Whether an answer can be cached: a verdict needs a probability, a location a valid choice. */
+export function isValidAnswer(ask: Ask, answer: unknown): boolean {
+  return ask.kind === 'verdict'
+    ? probabilityOf(answer) !== null
+    : isChoiceAnswer(answer, ask.criteria ?? {});
+}
+
 export function selectedLocation(
   answer: unknown,
   candidates: Record<string, LineRange>,
@@ -112,85 +199,4 @@ export function locationOfLine(snippet: string, line: number): Location {
     start: { line, column: text.search(/\S/) },
     end: { line, column: text.trimEnd().length },
   };
-}
-
-export function buildRequest(model: string, matches: readonly RequestMatch[]): JevRequest {
-  const snippets: Record<string, string> = {};
-  const questions: JevRequest['questions'] = {};
-  matches.forEach((match, index) => {
-    const ref = refAt(index);
-    snippets[ref] = locates(match)
-      ? sourceLines(match.snippet)
-          .map((text, index) => `L${index + 1}| ${text}`)
-          .join('\n')
-      : match.snippet;
-    questions[ref] = {
-      type: 'noul',
-      instructions: `Consider only snippet "${ref}" in state.snippets. ${match.rule.question}`,
-    };
-    if (locates(match)) {
-      questions[`${ref}_location`] = locationQuestion(
-        match,
-        ref,
-        locationCandidates(match.snippet),
-      );
-    }
-  });
-  return { model, state: { snippets }, questions };
-}
-
-function answersOf(json: unknown): Record<string, unknown> {
-  if (typeof json === 'object' && json !== null && 'answers' in json) {
-    const { answers } = json;
-    if (typeof answers === 'object' && answers !== null && !Array.isArray(answers)) {
-      return answers as Record<string, unknown>;
-    }
-  }
-  throw new Error('response has no answers object');
-}
-
-function modelOf(json: unknown): string {
-  if (typeof json === 'object' && json !== null && 'model' in json) {
-    const { model } = json;
-    if (typeof model === 'string' && model.length > 0) return model;
-  }
-  throw new Error('response has no model id');
-}
-
-const noulOf = (answer: unknown): unknown =>
-  typeof answer === 'object' && answer !== null && 'noul' in answer ? answer.noul : undefined;
-
-export function choiceQuestionsOf(request: JevRequest): ChoiceQuestions {
-  return Object.fromEntries(
-    Object.entries(request.questions)
-      .filter((entry): entry is [string, ChoiceQuestion] => entry[1].type === 'choice')
-      .map(([id, question]) => [id, question.criteria]),
-  );
-}
-
-export function parseVerdicts(
-  json: unknown,
-  refs: readonly string[],
-  choices: ChoiceQuestions = {},
-): Verdicts {
-  const model = modelOf(json);
-  const answers = answersOf(json);
-  const scores: Record<string, number> = {};
-  for (const ref of refs) {
-    const noul = noulOf(answers[ref]);
-    if (typeof noul !== 'number' || !(noul >= 0 && noul <= 1)) {
-      throw new Error(`response has no probability in [0, 1] for "${ref}"`);
-    }
-    scores[ref] = noul;
-  }
-  // Malformed locations do not invalidate violation scores, but must be retried instead of cached.
-  const complete = Object.entries(choices).every(([id, criteria]) =>
-    isChoiceAnswer(answers[id], criteria),
-  );
-  return { model, scores, answers, complete };
-}
-
-export function cacheKey({ endpoint, request }: { endpoint: string; request: JevRequest }): string {
-  const payload = JSON.stringify({ v: 3, endpoint, request });
-  return createHash('sha256').update(payload).digest('hex');
 }
