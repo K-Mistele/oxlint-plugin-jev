@@ -22,7 +22,7 @@
             "id": "no-prompt-injection",
             "target": "function",
             "question": "Does this function build a language model prompt by concatenating untrusted user input into the instructions?",
-            "cutoff": 0.8
+            "cutoff": 0.6
           }
         ]
       }

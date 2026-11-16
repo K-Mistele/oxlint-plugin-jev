@@ -2,6 +2,7 @@ import path from 'node:path';
 import type { Backend, ResolvedOptions } from './types.ts';
 
 const DEFAULT_TYPESAFE_URL = 'https://api.typesafe.ai/v1';
+const DEFAULT_FACTORY_URL = 'https://api.factory.ai';
 
 const env = (name: string): string => (process.env[name] ?? '').trim();
 
@@ -13,12 +14,21 @@ export function typeSafeBaseURL(): string {
   return env('TYPESAFE_AI_BASE_URL').replace(/\/+$/, '') || DEFAULT_TYPESAFE_URL;
 }
 
+/** Factory's decision route speaks TypeSafe's wire format under `/api/llm/decision/v1`. */
+export function factoryDecisionBaseURL(): string {
+  const host = env('FACTORY_API_BASE_URL').replace(/\/+$/, '') || DEFAULT_FACTORY_URL;
+  return `${host}/api/llm/decision/v1`;
+}
+
+// Factory serves only model aliases such as `jev-latest`; a versioned id gets a 400.
+const isPinnedJevModel = (model: string): boolean => /^jev-\d/.test(model);
+
 const hasGatewayCredentials = (): boolean =>
   env('AI_GATEWAY_API_KEY') !== '' || env('VERCEL_OIDC_TOKEN') !== '';
 
 /** Named in the warning when no Jev credential of any kind is set. */
 export const NO_JEV_CREDENTIALS =
-  'no Jev credentials: TYPESAFE_API_KEY, TYPESAFE_AI_API_KEY, and AI_GATEWAY_API_KEY are all unset';
+  'no Jev credentials: TYPESAFE_API_KEY, TYPESAFE_AI_API_KEY, FACTORY_API_KEY, and AI_GATEWAY_API_KEY are all unset';
 
 /** The AI Gateway id for a TypeSafe model id; `jev-latest` is published there as `typesafe-ai/jev`. */
 export const gatewayModelFor = (model: string): string =>
@@ -52,26 +62,47 @@ export function backendFor(options: ResolvedOptions): BackendResult {
       id: `gateway ${options.model}`,
     };
   }
-  const apiKey = env('TYPESAFE_API_KEY') || env('TYPESAFE_AI_API_KEY');
-  if (apiKey === '') {
-    if (!hasGatewayCredentials()) return { ok: false, reason: NO_JEV_CREDENTIALS };
-    const model = gatewayModelFor(options.model);
+  const typeSafeKey = env('TYPESAFE_API_KEY') || env('TYPESAFE_AI_API_KEY');
+  if (typeSafeKey !== '') {
+    const baseURL = typeSafeBaseURL();
     return {
       ok: true,
-      backend: { kind: 'gateway', model, longContext: options.longContext },
-      id: `gateway ${model}`,
+      backend: {
+        kind: 'typesafe',
+        model: options.model,
+        apiKey: typeSafeKey,
+        baseURL,
+        longContext: options.longContext,
+      },
+      id: `typesafe ${baseURL} ${options.model}`,
     };
   }
-  const baseURL = typeSafeBaseURL();
+  const factoryKey = env('FACTORY_API_KEY');
+  if (factoryKey !== '') {
+    if (isPinnedJevModel(options.model)) {
+      return {
+        ok: false,
+        reason: `Factory serves only Jev aliases such as "jev-latest", not the pinned model "${options.model}"`,
+      };
+    }
+    const baseURL = factoryDecisionBaseURL();
+    return {
+      ok: true,
+      backend: {
+        kind: 'typesafe',
+        model: options.model,
+        apiKey: factoryKey,
+        baseURL,
+        longContext: options.longContext,
+      },
+      id: `factory ${baseURL} ${options.model}`,
+    };
+  }
+  if (!hasGatewayCredentials()) return { ok: false, reason: NO_JEV_CREDENTIALS };
+  const model = gatewayModelFor(options.model);
   return {
     ok: true,
-    backend: {
-      kind: 'typesafe',
-      model: options.model,
-      apiKey,
-      baseURL,
-      longContext: options.longContext,
-    },
-    id: `typesafe ${baseURL} ${options.model}`,
+    backend: { kind: 'gateway', model, longContext: options.longContext },
+    id: `gateway ${model}`,
   };
 }
