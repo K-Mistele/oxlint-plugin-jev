@@ -29,6 +29,7 @@
     "lint": "vp lint",
     "fmt": "vp fmt",
     "example": "vp run build && ./node_modules/oxlint/bin/oxlint -c example/.oxlintrc.json example/",
+    "prepare": "vp pack",
     "prepublishOnly": "vp run build"
   },
   "dependencies": {
