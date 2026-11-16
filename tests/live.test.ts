@@ -11,8 +11,9 @@ const RULE_IDS = ['name-matches-behavior', 'no-pii-in-logs', 'no-prompt-injectio
 const skip =
   process.env.JEV_LIVE !== '1'
     ? 'set JEV_LIVE=1 to lint example/ against the real API'
-    : (process.env.TYPESAFE_API_KEY ?? '').trim() === ''
-      ? 'TYPESAFE_API_KEY is not set'
+    : (process.env.TYPESAFE_API_KEY ?? '').trim() === '' &&
+        (process.env.FACTORY_API_KEY ?? '').trim() === ''
+      ? 'neither TYPESAFE_API_KEY nor FACTORY_API_KEY is set'
       : false;
 
 test.skipIf(skip !== false)(
@@ -23,7 +24,7 @@ test.skipIf(skip !== false)(
     delete env.CI;
     const result = spawnSync(
       path.join(root, 'node_modules', 'oxlint', 'bin', 'oxlint'),
-      ['-c', 'example/.oxlintrc.json', 'example/'],
+      ['-c', 'example/.oxlintrc.json', '--format', 'unix', 'example/'],
       { cwd: root, encoding: 'utf8', env },
     );
     const lines = result.stdout.split('\n').filter((line) => line.includes('jev(ask)'));
