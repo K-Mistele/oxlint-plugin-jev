@@ -148,9 +148,9 @@ function startPass(context: Context, member: Member): Pass | 'skip' {
     if (process.env.CI && options.ci === 'fail') {
       if (missingKeyRaised) return 'skip';
       missingKeyRaised = true;
-      throw new Error(`oxlint-plugin-jev: ${chosen.missing} is not set`);
+      throw new Error(`oxlint-plugin-jev: ${chosen.reason}`);
     }
-    warnOnce(`missing-key:${chosen.missing}`, `${chosen.missing} is not set, skipping Jev checks`);
+    warnOnce(`missing-key:${chosen.reason}`, `${chosen.reason}, skipping Jev checks`);
     return 'skip';
   }
   let changed: ChangedLines | null = null;

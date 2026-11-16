@@ -16,16 +16,24 @@ export function typeSafeBaseURL(): string {
 const hasGatewayCredentials = (): boolean =>
   env('AI_GATEWAY_API_KEY') !== '' || env('VERCEL_OIDC_TOKEN') !== '';
 
+/** Named in the warning when no Jev credential of any kind is set. */
+export const NO_JEV_CREDENTIALS =
+  'no Jev credentials: TYPESAFE_API_KEY, TYPESAFE_AI_API_KEY, and AI_GATEWAY_API_KEY are all unset';
+
+/** The AI Gateway id for a TypeSafe model id; `jev-latest` is published there as `typesafe-ai/jev`. */
+export const gatewayModelFor = (model: string): string =>
+  model === 'jev-latest' ? 'typesafe-ai/jev' : `typesafe-ai/${model}`;
+
 export type BackendResult =
   | { ok: true; backend: Backend; id: string }
-  | { ok: false; missing: string };
+  | { ok: false; reason: string };
 
-/** Picks the backend for a rule list, or names the credential that is missing. */
+/** Picks the backend for a rule list, or says which credential is missing. */
 export function backendFor(options: ResolvedOptions): BackendResult {
   const { judge } = options;
   if (judge !== undefined) {
     if (judge.provider === undefined && !hasGatewayCredentials()) {
-      return { ok: false, missing: 'AI_GATEWAY_API_KEY' };
+      return { ok: false, reason: 'AI_GATEWAY_API_KEY is not set' };
     }
     const provider =
       judge.provider === undefined ? undefined : path.resolve(process.cwd(), judge.provider);
@@ -37,7 +45,7 @@ export function backendFor(options: ResolvedOptions): BackendResult {
   }
   // A provider-prefixed id such as `typesafe-ai/jev` is an AI Gateway model.
   if (options.model.includes('/')) {
-    if (!hasGatewayCredentials()) return { ok: false, missing: 'AI_GATEWAY_API_KEY' };
+    if (!hasGatewayCredentials()) return { ok: false, reason: 'AI_GATEWAY_API_KEY is not set' };
     return {
       ok: true,
       backend: { kind: 'gateway', model: options.model, longContext: options.longContext },
@@ -45,7 +53,15 @@ export function backendFor(options: ResolvedOptions): BackendResult {
     };
   }
   const apiKey = env('TYPESAFE_API_KEY') || env('TYPESAFE_AI_API_KEY');
-  if (apiKey === '') return { ok: false, missing: 'TYPESAFE_API_KEY' };
+  if (apiKey === '') {
+    if (!hasGatewayCredentials()) return { ok: false, reason: NO_JEV_CREDENTIALS };
+    const model = gatewayModelFor(options.model);
+    return {
+      ok: true,
+      backend: { kind: 'gateway', model, longContext: options.longContext },
+      id: `gateway ${model}`,
+    };
+  }
   const baseURL = typeSafeBaseURL();
   return {
     ok: true,

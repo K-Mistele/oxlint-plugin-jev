@@ -40,6 +40,9 @@ function runOxlint(env: Record<string, string>, format: 'unix' | 'json' | 'defau
   const clean = { ...process.env };
   delete clean.CI;
   delete clean.TYPESAFE_API_KEY;
+  delete clean.TYPESAFE_AI_API_KEY;
+  delete clean.AI_GATEWAY_API_KEY;
+  delete clean.VERCEL_OIDC_TOKEN;
   return spawnSync(oxlintBin, ['--format', format, '-c', 'example/.oxlintrc.json', 'example/'], {
     cwd: root,
     encoding: 'utf8',
@@ -390,6 +393,9 @@ test('a missing key under CI fails once when both rules use ci fail', () => {
   writeFileSync(path.join(project, 'rows.js'), piiCall);
   const clean = { ...process.env };
   delete clean.TYPESAFE_API_KEY;
+  delete clean.TYPESAFE_AI_API_KEY;
+  delete clean.AI_GATEWAY_API_KEY;
+  delete clean.VERCEL_OIDC_TOKEN;
   const result = spawnSync(oxlintBin, ['-c', '.oxlintrc.json', 'rows.js'], {
     cwd: project,
     encoding: 'utf8',
@@ -397,7 +403,7 @@ test('a missing key under CI fails once when both rules use ci fail', () => {
   });
   const output = `${result.stdout}${result.stderr}`;
   expect(result.status, `oxlint fails the run\n${output}`).not.toBe(0);
-  expect(output.match(/TYPESAFE_API_KEY is not set/g)?.length, output).toBe(1);
+  expect(output.match(/no Jev credentials/g)?.length, output).toBe(1);
 });
 function runWithOptions(options: unknown) {
   const config = path.join(mkdtempSync(path.join(tmpdir(), 'jev-config-')), '.oxlintrc.json');
