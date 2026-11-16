@@ -72,6 +72,7 @@ export const SCHEMA = {
             },
           },
           cutoff: { type: 'number', minimum: 0, maximum: 1 },
+          message: { type: 'string', minLength: 1 },
         },
       },
     },
@@ -89,8 +90,9 @@ export function checkOptions(raw: unknown): ResolvedOptions {
   const options = raw as ResolvedOptions;
   if (!Array.isArray(options.rules)) fail('options.rules must list at least one rule');
   const seen = new Set<string>();
-  for (const { id, target, location } of options.rules) {
+  for (const { id, target, location, message } of options.rules) {
     if (location && target !== 'file') fail('location is supported only for file rules');
+    if (message !== undefined && message.trim() === '') fail(`rule "${id}" has a blank message`);
     if (seen.has(id)) fail(`rule id "${id}" is used more than once`);
     seen.add(id);
   }

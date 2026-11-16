@@ -243,6 +243,164 @@ test('a file over maxMatchesPerFile is capped and named on stderr', async () => 
   expect(result.status, 'the cap does not change the exit code').toBe(1);
 });
 
+// The answer cache lives under the linted project's node_modules, so reruns pass the same project.
+function runProject(
+  config: unknown,
+  files: Record<string, string>,
+  baseURL: string,
+  project = mkdtempSync(path.join(tmpdir(), 'jev-project-')),
+) {
+  writeFileSync(path.join(project, '.oxlintrc.json'), JSON.stringify(config));
+  for (const [name, text] of Object.entries(files)) writeFileSync(path.join(project, name), text);
+  const clean = { ...process.env };
+  delete clean.CI;
+  return spawnSync(oxlintBin, ['--format', 'unix', '-c', '.oxlintrc.json', ...Object.keys(files)], {
+    cwd: project,
+    encoding: 'utf8',
+    env: { ...clean, TYPESAFE_API_KEY: 'test-key', TYPESAFE_BASE_URL: baseURL },
+  });
+}
+
+const piiCall = 'console.log("row", user.email, user.phone);\n';
+const piiRule: JevRule = {
+  id: 'no-pii-in-logs',
+  target: 'call',
+  question: 'Does this call write personal data to a log?',
+  cutoff: 0.8,
+};
+
+test('a rule message replaces the question and keeps the id, model, and probability', async () => {
+  const { child, logPath, baseURL } = await startMockJev();
+  onTestFinished(() => {
+    child.kill();
+  });
+  const project = mkdtempSync(path.join(tmpdir(), 'jev-message-'));
+  const configWith = (message: string) => ({
+    jsPlugins: [pluginPath],
+    rules: { 'jev/ask': ['error', { rules: [{ ...piiRule, message }] }] },
+  });
+
+  const first = runProject(
+    configWith('Remove the email and phone.'),
+    { 'rows.js': piiCall },
+    baseURL,
+    project,
+  );
+  expect(first.status, `oxlint fails the run\n${first.stdout}${first.stderr}`).toBe(1);
+  expect(jevLines(first)).toEqual([
+    'rows.js:1:1: [no-pii-in-logs] Remove the email and phone. (jev-mock answered yes, 0.95 >= 0.80) [Error/jev(ask)]',
+  ]);
+  expect(asked(logPath).length, 'the file is asked about once').toBe(1);
+  expect(
+    JSON.stringify(asked(logPath)[0].body),
+    'the message is display text and is not sent to Jev',
+  ).not.toContain('Remove the email');
+
+  const second = runProject(
+    configWith('Log the user id instead.'),
+    { 'rows.js': piiCall },
+    baseURL,
+    project,
+  );
+  expect(asked(logPath).length, 'changing only the message keeps the cached answer').toBe(1);
+  expect(jevLines(second)).toEqual([
+    'rows.js:1:1: [no-pii-in-logs] Log the user id instead. (jev-mock answered yes, 0.95 >= 0.80) [Error/jev(ask)]',
+  ]);
+});
+
+test('jev/suggest reports at its own severity next to jev/ask', async () => {
+  const { child, logPath, baseURL } = await startMockJev();
+  onTestFinished(() => {
+    child.kill();
+  });
+  const smellRule: JevRule = {
+    id: 'feature-envy',
+    target: 'call',
+    question: 'Does this call write personal data to a log?',
+    cutoff: 0.8,
+    message: 'Possibly Feature Envy. Consider Move Function.',
+  };
+  const both = {
+    jsPlugins: [pluginPath],
+    rules: {
+      'jev/ask': ['error', { rules: [piiRule] }],
+      'jev/suggest': ['warn', { rules: [smellRule] }],
+    },
+  };
+  const result = runProject(both, { 'rows.js': piiCall }, baseURL);
+  const lines = result.stdout.split('\n').filter((line) => line.includes('jev('));
+  expect(lines.sort()).toEqual([
+    'rows.js:1:1: [feature-envy] Possibly Feature Envy. Consider Move Function. (jev-mock answered yes, 0.95 >= 0.80) [Warning/jev(suggest)]',
+    'rows.js:1:1: [no-pii-in-logs] jev-mock answered yes (0.95 >= 0.80): Does this call write personal data to a log? [Error/jev(ask)]',
+  ]);
+  expect(result.status, 'the error-level rule still fails the run').toBe(1);
+  expect(
+    asked(logPath).length,
+    'the two rules ask the same question about the same snippet, so the second reads the first one cache entry',
+  ).toBe(1);
+
+  const warnOnly = runProject(
+    { jsPlugins: [pluginPath], rules: { 'jev/suggest': ['warn', { rules: [smellRule] }] } },
+    { 'rows.js': piiCall },
+    baseURL,
+  );
+  expect(warnOnly.stdout).toContain('[Warning/jev(suggest)]');
+  expect(warnOnly.status, `warnings alone pass the run\n${warnOnly.stdout}`).toBe(0);
+});
+
+test('each rule gets its own maxMatchesPerFile budget and cap warning', async () => {
+  const { child, logPath, baseURL } = await startMockJev();
+  onTestFinished(() => {
+    child.kill();
+  });
+  const result = runProject(
+    {
+      jsPlugins: [pluginPath],
+      rules: {
+        'jev/ask': ['error', { maxMatchesPerFile: 2, rules: [piiRule] }],
+        'jev/suggest': [
+          'warn',
+          { maxMatchesPerFile: 1, rules: [{ ...piiRule, question: 'Is this a smell?' }] },
+        ],
+      },
+    },
+    { 'rows.js': piiCall.repeat(3) },
+    baseURL,
+  );
+  const counts = asked(logPath)
+    .map((request) => Object.keys(request.body.questions).length)
+    .sort((a, b) => a - b);
+  expect(counts, 'one request per rule, each capped by its own budget').toEqual([1, 2]);
+  expect(result.stderr).toContain(
+    '3 matches exceeded maxMatchesPerFile=2, 1 not checked by jev/ask',
+  );
+  expect(result.stderr).toContain(
+    '3 matches exceeded maxMatchesPerFile=1, 2 not checked by jev/suggest',
+  );
+});
+
+test('a missing key under CI fails once when both rules use ci fail', () => {
+  const project = mkdtempSync(path.join(tmpdir(), 'jev-nokey-'));
+  const options = { ci: 'fail', rules: [piiRule] };
+  writeFileSync(
+    path.join(project, '.oxlintrc.json'),
+    JSON.stringify({
+      jsPlugins: [pluginPath],
+      rules: { 'jev/ask': ['error', options], 'jev/suggest': ['warn', options] },
+    }),
+  );
+  writeFileSync(path.join(project, 'rows.js'), piiCall);
+  const clean = { ...process.env };
+  delete clean.TYPESAFE_API_KEY;
+  const result = spawnSync(oxlintBin, ['-c', '.oxlintrc.json', 'rows.js'], {
+    cwd: project,
+    encoding: 'utf8',
+    env: { ...clean, CI: '1' },
+  });
+  const output = `${result.stdout}${result.stderr}`;
+  expect(result.status, `oxlint fails the run\n${output}`).not.toBe(0);
+  expect(output.match(/TYPESAFE_API_KEY is not set/g)?.length, output).toBe(1);
+});
 function runWithOptions(options: unknown) {
   const config = path.join(mkdtempSync(path.join(tmpdir(), 'jev-config-')), '.oxlintrc.json');
   writeFileSync(
@@ -286,6 +444,16 @@ const badConfigs: [string, unknown, string][] = [
     'two rules share an id',
     { rules: [goodRule, { ...goodRule, target: 'file', question: 'Other?' }] },
     'oxlint-plugin-jev: rule id "a" is used more than once',
+  ],
+  [
+    'a message is empty',
+    { rules: [{ ...goodRule, message: '' }] },
+    'Value "" should NOT be shorter than 1 characters.',
+  ],
+  [
+    'a message is only whitespace',
+    { rules: [{ ...goodRule, message: '  ' }] },
+    'oxlint-plugin-jev: rule "a" has a blank message',
   ],
 ];
 

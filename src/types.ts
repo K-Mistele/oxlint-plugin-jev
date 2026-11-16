@@ -15,6 +15,8 @@ export interface JevRule {
   cutoff: number;
   /** File rules may select a source line, keeping a file-level finding below this probability. */
   location?: { question: string; cutoff: number };
+  /** Shown instead of the question when the rule fires. Not sent to Jev. */
+  message?: string;
 }
 
 export interface JevOptions {
@@ -88,5 +90,5 @@ export interface ReportNode {
  * internals are deliberately not part of the published type. */
 export interface JevPlugin {
   meta: { name: string };
-  rules: { ask: object };
+  rules: { ask: object; suggest: object };
 }
