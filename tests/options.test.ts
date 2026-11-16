@@ -53,6 +53,25 @@ test('accepts a location question on a file rule', () => {
   ).not.toThrow();
 });
 
+test('rejects a blank message', () => {
+  expect(() => checkOptions(withRules({ ...rule, message: ' \n ' }))).toThrow(
+    /^oxlint-plugin-jev: rule "a" has a blank message$/,
+  );
+});
+
+test('accepts a message', () => {
+  expect(() =>
+    checkOptions(withRules({ ...rule, message: 'Log the user id instead.' })),
+  ).not.toThrow();
+});
+
+test('offers message as an optional, non-empty per-rule string in the schema', () => {
+  expect(SCHEMA.properties.rules.items.properties.message).toEqual({
+    type: 'string',
+    minLength: 1,
+  });
+});
+
 test('maps every target to the node types the README documents', () => {
   expect(TARGET_NODE_TYPES).toEqual({
     function: ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'],

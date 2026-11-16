@@ -18,7 +18,7 @@ In CI, set `ci: "fail"` so a run that could not reach Jev fails instead of passi
 
 ## Config
 
-Add the plugin and its one rule, `jev/ask`, to `.oxlintrc.json`. Your English rules go in the options.
+Add the plugin and its rule, `jev/ask`, to `.oxlintrc.json`. Your English rules go in the options.
 
 ```json
 {
@@ -47,13 +47,14 @@ Add the plugin and its one rule, `jev/ask`, to `.oxlintrc.json`. Your English ru
 }
 ```
 
-| Field      | What it is                                                                                           |
-| ---------- | ---------------------------------------------------------------------------------------------------- |
-| `id`       | Shown in the error message. Unique in the list.                                                      |
-| `target`   | `"function"`, `"call"`, `"jsx"`, or `"file"`.                                                        |
-| `question` | A yes/no question. "Yes" means "report this".                                                        |
-| `cutoff`   | 0 to 1. Report when Jev's yes-probability is at or above it.                                         |
-| `location` | Optional for file rules: a source-location `question` and a `cutoff` greater than 0.5 and at most 1. |
+| Field      | What it is                                                                                                        |
+| ---------- | ----------------------------------------------------------------------------------------------------------------- |
+| `id`       | Shown in the error message. Unique in the list.                                                                   |
+| `target`   | `"function"`, `"call"`, `"jsx"`, or `"file"`.                                                                     |
+| `question` | A yes/no question. "Yes" means "report this".                                                                     |
+| `cutoff`   | 0 to 1. Report when Jev's yes-probability is at or above it.                                                      |
+| `location` | Optional for file rules: a source-location `question` and a `cutoff` greater than 0.5 and at most 1.              |
+| `message`  | Optional. Shown instead of the question when the rule fires. See [Messages and warnings](#messages-and-warnings). |
 
 `target` decides what Jev gets to read. There is no selector syntax and no other target.
 
@@ -95,13 +96,72 @@ diagnostic; location questions only use complete source. Rules without `location
 
 `TYPESAFE_BASE_URL` points the plugin at another host. The tests use it for a mock.
 
+## Messages and warnings
+
+A rule's optional `message` replaces the question in the diagnostic. Use it to say what to do about
+a finding. The rule id, the model that answered, and both numbers are still appended:
+
+```text
+[feature-envy] Possibly Feature Envy: ... Consider Move Function. (jev-1.13.0 answered yes, 0.91 >= 0.85)
+```
+
+`message` is plain text with no placeholders, since the id and numbers are always shown. It is not
+sent to Jev, so changing it does not re-ask anything.
+
+Oxlint takes a diagnostic's severity from the rule's config entry, and a JS plugin cannot set it per
+report. So the plugin has a second rule, `jev/suggest`, that behaves exactly like `jev/ask` and takes
+the same options. Configure it at `"warn"` for findings that should not fail the run, such as code
+smells:
+
+```json
+{
+  "jsPlugins": ["oxlint-plugin-jev"],
+  "rules": {
+    "jev/ask": [
+      "error",
+      {
+        "ci": "fail",
+        "rules": [
+          {
+            "id": "no-pii-in-logs",
+            "target": "call",
+            "question": "Does this call write personal data, such as an email or phone number, to a log or console?",
+            "cutoff": 0.8,
+            "message": "Personal data is written to a log. Log an opaque id instead."
+          }
+        ]
+      }
+    ],
+    "jev/suggest": [
+      "warn",
+      {
+        "rules": [
+          {
+            "id": "feature-envy",
+            "target": "function",
+            "question": "Does this function mostly read or change the fields of an object passed in or imported from another module, rather than its own module's data?",
+            "cutoff": 0.85,
+            "message": "Possibly Feature Envy: this function mostly reads another module's data. Consider Move Function into the module that owns that data."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The two rules are configured independently, so each has its own `rules` list and settings. Each
+enabled rule sends its own request per file with its own `maxMatchesPerFile` budget, so enabling
+both can double the requests per file. Identical requests share a cache entry. Rule ids only need to
+be unique within one rule's list.
+
 ## How it works
 
 One initial request per file, with every match in it. A file rule with `location` includes numbered
 source and a Choice question. Above 254 nonblank lines, Jev selects a range and refines it in follow-up
 requests with the same full-file context. All requests share the per-file `timeoutMs` budget.
 
-Answers are cached under `node_modules/.cache/oxlint-plugin-jev`, keyed by the request. Changing a snippet or a question re-asks that file. Changing a cutoff or an `id` does not.
+Answers are cached under `node_modules/.cache/oxlint-plugin-jev`, keyed by the request. Changing a snippet or a question re-asks that file. Changing a cutoff, an `id`, or a `message` does not.
 
 Location responses are cached too, including valid uncertain answers. Malformed location answers
 are retried on the next run, including malformed entries already in the cache.
@@ -118,7 +178,7 @@ Later matches in that file keep their original locations without further refinem
 
 The oxlint VS Code extension lints as you type, and every keystroke inside a match is a paid request that blocks the language server until Jev answers.
 
-Keep `jev/ask` out of the config your editor reads, and put it in an overlay for CI and pre-push. Leave `jsPlugins` in the base config, since the overlay inherits it.
+Keep `jev/ask` and `jev/suggest` out of the config your editor reads, and put it in an overlay for CI and pre-push. Leave `jsPlugins` in the base config, since the overlay inherits it.
 
 ```json
 {

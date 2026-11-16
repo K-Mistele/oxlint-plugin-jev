@@ -252,8 +252,8 @@ function createOnce(context: Context): VisitorWithHooks {
       const cap = collected.options.maxMatchesPerFile;
       const total = collected.matches.length + collected.dropped;
       warnOnce(
-        `capped:${context.filename}`,
-        `${total} matches exceeded maxMatchesPerFile=${cap}, ${collected.dropped} not checked (${context.filename})`,
+        `capped:${context.id}:${context.filename}`,
+        `${total} matches exceeded maxMatchesPerFile=${cap}, ${collected.dropped} not checked by ${context.id} (${context.filename})`,
       );
     }
     const deadline = Date.now() + collected.options.timeoutMs;
@@ -270,7 +270,7 @@ function createOnce(context: Context): VisitorWithHooks {
     for (const [index, match] of collected.matches.entries()) {
       const score = verdicts.scores[refAt(index)];
       if (score >= match.rule.cutoff) {
-        const { id, cutoff, question } = match.rule;
+        const { id, cutoff, question, message } = match.rule;
         // Avoid further requests after a failed refinement while preserving every confirmed finding.
         const located: LocatedResult =
           failure === null
@@ -288,13 +288,14 @@ function createOnce(context: Context): VisitorWithHooks {
           failure = { id, loc: match.loc, reason: located.failure };
         context.report({
           loc: located.loc,
-          messageId: 'yes',
+          messageId: message === undefined ? 'yes' : 'custom',
           data: {
             id,
             model: verdicts.model,
             score: score.toFixed(2),
             cutoff: cutoff.toFixed(2),
             question,
+            message,
           },
         });
       }
@@ -325,14 +326,17 @@ const meta = {
   defaultOptions: [DEFAULTS],
   messages: {
     yes: '[{{id}}] {{model}} answered yes ({{score}} >= {{cutoff}}): {{question}}',
+    custom: '[{{id}}] {{message}} ({{model}} answered yes, {{score}} >= {{cutoff}})',
     unlocated:
       'oxlint-plugin-jev: {{reason}} while refining the location of [{{id}}]; the finding is reported at the file level',
   },
 } satisfies RuleMeta;
 
+// `suggest` is `ask` under a second name, because a JS plugin cannot choose a report's severity:
+// oxlint takes it from the rule's config entry, so a warn-level rule list needs its own rule.
 const plugin: JevPlugin = {
   meta: { name: 'jev' },
-  rules: { ask: { meta, createOnce } },
+  rules: { ask: { meta, createOnce }, suggest: { meta, createOnce } },
 } satisfies Plugin;
 
 export default plugin;
