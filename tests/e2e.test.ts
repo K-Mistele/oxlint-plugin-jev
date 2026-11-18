@@ -442,7 +442,7 @@ const badConfigs: [string, unknown, string][] = [
   [
     'a plugin-level field is unknown',
     { foo: 1, rules: [goodRule] },
-    'Unexpected property "foo". Expected properties: "ci", "timeoutMs", "maxMatchesPerFile", "maxSnippetChars", "model", "longContext", "judge", "changedOnly", "changedBase", "rules".',
+    'Unexpected property "foo". Expected properties: "ci", "timeoutMs", "maxMatchesPerFile", "maxSnippetChars", "model", "longContext", "judge", "rules".',
   ],
   [
     'two rules share an id',

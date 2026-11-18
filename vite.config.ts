@@ -4,7 +4,7 @@ export default defineConfig({
   pack: {
     // `sync-jev` is packed so the worker test can drive the built copy, which is the only place
     // where its `./worker.mjs` URL resolves. It is shipped but deliberately not an export.
-    entry: ['src/index.ts', 'src/worker.ts', 'src/sync-jev.ts'],
+    entry: ['src/index.ts', 'src/changed.ts', 'src/worker.ts', 'src/sync-jev.ts'],
     platform: 'node',
     deps: { resolveDepSubpath: true },
     dts: {

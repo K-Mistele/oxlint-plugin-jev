@@ -89,8 +89,6 @@ test('defaults the plugin fields the README documents', () => {
     maxSnippetChars: 4000,
     model: 'jev-latest',
     longContext: false,
-    changedOnly: false,
-    changedBase: 'HEAD',
   });
 });
 

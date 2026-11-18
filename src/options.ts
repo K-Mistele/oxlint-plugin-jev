@@ -46,8 +46,6 @@ export const DEFAULTS = {
   maxSnippetChars: 4000,
   model: 'jev-latest',
   longContext: false,
-  changedOnly: false,
-  changedBase: 'HEAD',
 } satisfies Omit<ResolvedOptions, 'rules' | 'judge'>;
 
 // `rules` is absent from DEFAULTS and oxlint validates DEFAULTS against this schema at
@@ -71,8 +69,6 @@ export const SCHEMA = {
         provider: { type: 'string', minLength: 1 },
       },
     },
-    changedOnly: { type: 'boolean' },
-    changedBase: { type: 'string', minLength: 1 },
     rules: {
       type: 'array',
       minItems: 1,
