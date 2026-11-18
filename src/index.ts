@@ -11,7 +11,7 @@ import type {
 import { answerAll, type AnswersResult } from './answers.ts';
 import { backendFor } from './backend.ts';
 import { defaultCacheDir } from './cache.ts';
-import { changedLines, overlaps, ruleMode, settingsBase, type ChangedLines } from './changed.ts';
+import { changedLines, overlaps, type ChangedLines } from './changed.ts';
 import {
   locates,
   locationAsk,
@@ -27,8 +27,9 @@ import {
   checkOptions,
   checkPluginOptions,
   DEFAULTS,
+  MODE_SCHEMA,
   REPORT_LOC,
-  SCHEMA,
+  RULE_SCHEMA,
   snippetNodeFor,
   TARGET_NODE_TYPES,
 } from './options.ts';
@@ -50,8 +51,10 @@ export type {
   JevRule,
   JevRulesPlugin,
   JudgeOptions,
+  ModeOptions,
   Target,
 } from './types.ts';
+export type { Mode } from './changed.ts';
 
 const optionsByRaw = new WeakMap<object, ResolvedOptions>();
 const warnedReasons = new Set<string>();
@@ -111,8 +114,8 @@ interface Pass {
   readonly options: ResolvedOptions;
   readonly backend: Backend;
   readonly backendId: string;
-  /** The file's changed lines, computed on first use by a rule in `"changed"` mode. */
-  readonly changedLines: () => ChangedLines;
+  /** The file's changed lines against `base`, computed on first use by a rule in `"changed"` mode. */
+  readonly changedLines: (base: string | undefined) => ChangedLines;
   readonly matches: Match[];
   dropped: number;
   outcome: AnswersResult | null;
@@ -154,17 +157,23 @@ function startPass(context: Context, member: Member): Pass | 'skip' {
     warnOnce(`missing-key:${chosen.reason}`, `${chosen.reason}, skipping Jev checks`);
     return 'skip';
   }
-  const base = settingsBase(context.settings);
-  let changed: ChangedLines | undefined;
+  const changedByBase = new Map<string, ChangedLines>();
   return {
     filename: context.filename,
     options,
     backend: chosen.backend,
     backendId: chosen.id,
-    changedLines: () =>
-      (changed ??= changedLines(context.filename, base, (message) =>
-        warnOnce(`changed:${message}`, message),
-      )),
+    changedLines: (base) => {
+      const key = base ?? '';
+      let lines = changedByBase.get(key);
+      if (lines === undefined) {
+        lines = changedLines(context.filename, base, (message) =>
+          warnOnce(`changed:${message}`, message),
+        );
+        changedByBase.set(key, lines);
+      }
+      return lines;
+    },
     matches: [],
     dropped: 0,
     outcome: null,
@@ -173,6 +182,25 @@ function startPass(context: Context, member: Member): Pass | 'skip' {
     refinementFailed: false,
     failureRaised: false,
   };
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * The rule's own `mode` and `base` options. Every rule checks the whole file unless its options say
+ * `mode: "changed"`; `JEV_MODE=all` turns `"changed"` off for a full run.
+ */
+function modeOf(context: Context): { changed: boolean; base: string | undefined } {
+  const forced = (process.env.JEV_MODE ?? '').trim();
+  if (forced !== '' && forced !== 'all') {
+    warnOnce(`mode-env:${forced}`, `JEV_MODE must be "all" or unset, not "${forced}"; ignoring it`);
+  }
+  const own: unknown = context.options[0];
+  if (forced === 'all' || !isRecord(own) || own.mode !== 'changed') {
+    return { changed: false, base: undefined };
+  }
+  return { changed: true, base: typeof own.base === 'string' ? own.base : undefined };
 }
 
 function runBatch(pass: Pass, name: string, filename: string): AnswersResult {
@@ -292,9 +320,8 @@ function visitorsFor(
     if (pass === null) return;
     const rules = nodeTypeIndex(member.rules(pass.options)).get(type);
     if (rules === undefined) return;
-    // Jev rules default to "changed": every match is a paid request.
-    const lines =
-      ruleMode(context.settings, context.id, 'changed') === 'changed' ? pass.changedLines() : 'all';
+    const mode = modeOf(context);
+    const lines = mode.changed ? pass.changedLines(mode.base) : 'all';
     // A file rule in an unchanged file sends nothing either.
     if (lines !== 'all' && lines.size === 0) return;
     for (const rule of rules) {
@@ -373,7 +400,7 @@ const meta = {
     description:
       "Ask TypeSafe Jev a plain-English yes/no question about matched code and report when the yes-probability clears the rule's cutoff.",
   },
-  schema: [SCHEMA],
+  schema: [RULE_SCHEMA],
   defaultOptions: [DEFAULTS],
   messages,
 } satisfies RuleMeta;
@@ -418,7 +445,7 @@ export function createJevPlugin(options: JevPluginOptions): JevRulesPlugin {
       meta: {
         type: 'problem',
         docs: { description: rule.question },
-        schema: [],
+        schema: [MODE_SCHEMA],
         messages,
       } satisfies RuleMeta,
       createOnce: (context: Context) => visitorsFor(group, member, context, nodeTypes),

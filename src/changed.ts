@@ -3,22 +3,14 @@ import { realpathSync } from 'node:fs';
 import path from 'node:path';
 
 /**
- * How a rule picks what to check. `"all"` checks every line; `"changed"` checks only lines that
- * differ from the merge base of `HEAD` and the default branch, so findings on untouched lines are
- * ignored.
+ * How a rule picks what to check, set in its own options. `"all"` (the default) checks every line;
+ * `"changed"` checks only lines that differ from the merge base of `HEAD` and the default branch,
+ * so matches on untouched lines are never sent.
  */
 export type Mode = 'all' | 'changed';
 
 /** Changed line numbers of one file, or `'all'` when every line counts as changed. */
 export type ChangedLines = ReadonlySet<number> | 'all';
-
-/**
- * The oxlint `settings` key that carries per-rule modes and the base ref, so a rule reads its mode
- * from `context.settings` instead of from its own options:
- *
- * `settings: { changedLines: { rules: { "<plugin>/<rule>": "changed" }, base: "origin/main" } }`
- */
-export const SETTINGS_KEY = 'changedLines';
 
 /** Tried in order after `refs/remotes/origin/HEAD` when resolving the default branch. */
 export const DEFAULT_BRANCHES: readonly string[] = [
@@ -56,28 +48,6 @@ const succeeds = (cwd: string, args: string[]): boolean => {
 
 const messageOf = (error: unknown): string =>
   error instanceof Error ? error.message.trim() : String(error);
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-function changedSettings(settings: unknown): Record<string, unknown> | undefined {
-  if (!isRecord(settings)) return undefined;
-  const own = settings[SETTINGS_KEY];
-  return isRecord(own) ? own : undefined;
-}
-
-/** The mode `settings.changedLines.rules` gives `ruleId`, or `fallback` when it names none. */
-export function ruleMode(settings: unknown, ruleId: string, fallback: Mode): Mode {
-  const rules = changedSettings(settings)?.rules;
-  const mode = isRecord(rules) ? rules[ruleId] : undefined;
-  return mode === 'all' || mode === 'changed' ? mode : fallback;
-}
-
-/** The base ref `settings.changedLines.base` names, if any. */
-export function settingsBase(settings: unknown): string | undefined {
-  const base = changedSettings(settings)?.base;
-  return typeof base === 'string' && base.trim() !== '' ? base.trim() : undefined;
-}
 
 const HUNK = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
 
@@ -150,7 +120,7 @@ function computeChanges(root: string, base: string | undefined): RepoChanges {
   const ref = resolveBase(root, base);
   if (ref === null) {
     throw new Error(
-      `no default branch found (origin/HEAD, ${DEFAULT_BRANCHES.join(', ')}); set ${BASE_ENV} or the base setting`,
+      `no default branch found (origin/HEAD, ${DEFAULT_BRANCHES.join(', ')}); set ${BASE_ENV} or the rule's base option`,
     );
   }
   const mergeBase = git(root, ['merge-base', ref, 'HEAD']).trim();

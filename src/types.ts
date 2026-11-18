@@ -1,4 +1,5 @@
 import type { Location, Range } from '@oxlint/plugins';
+import type { Mode } from './changed.ts';
 
 export type Target = 'function' | 'call' | 'jsx' | 'file';
 
@@ -38,7 +39,15 @@ export interface SharedOptions {
   judge?: JudgeOptions;
 }
 
-export interface JevOptions extends SharedOptions {
+/** Per-rule options: `jev/ask` and `jev/suggest` take them next to `rules`, `createJevPlugin` rules as their only option. */
+export interface ModeOptions {
+  /** `"changed"` asks only about matches on lines changed since the merge base with the default branch. Default `"all"`. */
+  mode?: Mode;
+  /** The ref whose merge base with `HEAD` `"changed"` diffs against. Default: `JEV_CHANGED_BASE`, then the default branch. */
+  base?: string;
+}
+
+export interface JevOptions extends SharedOptions, ModeOptions {
   rules: JevRule[];
 }
 
@@ -49,7 +58,9 @@ export interface JevPluginOptions extends SharedOptions {
 }
 
 /** Options as a rule sees them, with the defaults already merged underneath. */
-export type ResolvedOptions = Required<Omit<JevOptions, 'judge'>> & { judge?: JudgeOptions };
+export type ResolvedOptions = Required<Omit<JevOptions, 'judge' | keyof ModeOptions>> & {
+  judge?: JudgeOptions;
+};
 
 export interface RequestMatch {
   readonly rule: Pick<JevRule, 'question' | 'location'>;

@@ -1,6 +1,5 @@
 {
   "jsPlugins": ["../dist/index.mjs"],
-  "settings": { "changedLines": { "rules": { "jev/ask": "all" } } },
   "rules": {
     "jev/ask": [
       "error",

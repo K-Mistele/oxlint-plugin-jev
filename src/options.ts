@@ -97,6 +97,24 @@ export const SCHEMA = {
   },
 } satisfies RuleOptionsSchema;
 
+export const MODE_PROPERTIES = {
+  mode: { enum: ['all', 'changed'] },
+  base: { type: 'string' as const, minLength: 1 },
+};
+
+/** `jev/ask` and `jev/suggest`: the shared options plus the rule's own mode. */
+export const RULE_SCHEMA = {
+  ...SCHEMA,
+  properties: { ...SCHEMA.properties, ...MODE_PROPERTIES },
+} satisfies RuleOptionsSchema;
+
+/** A `createJevPlugin` rule takes only its mode; everything else is set on the plugin. */
+export const MODE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: MODE_PROPERTIES,
+} satisfies RuleOptionsSchema;
+
 function fail(message: string): never {
   throw new Error(`oxlint-plugin-jev: ${message}`);
 }
