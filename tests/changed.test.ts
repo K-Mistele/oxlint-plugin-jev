@@ -1,6 +1,9 @@
 import { execFileSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { expect, test } from 'vite-plus/test';
-import { parseDiff } from '../src/changed.ts';
+import { defaultBase, parseDiff, ruleMode } from '../src/changed.ts';
 import type { JevRule } from '../src/types.ts';
 import { pluginPath, scratchProject, snippetsOf } from './project.ts';
 
@@ -21,7 +24,7 @@ const fileRule: JevRule = {
 const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
 const git = (cwd: string, ...args: string[]) =>
   execFileSync('git', args, { cwd, env: gitEnv, encoding: 'utf8' });
-const commit = (cwd: string, message: string) =>
+const commit = (cwd: string, message: string, ...args: string[]) =>
   git(
     cwd,
     '-c',
@@ -31,26 +34,40 @@ const commit = (cwd: string, message: string) =>
     'commit',
     '-qm',
     message,
+    ...args,
   );
 
 const twoCalls = (first: string, second: string) =>
   `console.log("${first}", user.email, user.phone);\n\nconsole.log("${second}", user.email, user.phone);\n`;
 
-async function repo(options: Record<string, unknown>) {
+const config = (settings?: Record<string, unknown>) =>
+  JSON.stringify({
+    jsPlugins: [pluginPath],
+    rules: { 'jev/ask': ['error', { rules: [callRule, fileRule] }] },
+    ...(settings === undefined ? {} : { settings: { changedLines: settings } }),
+  });
+
+/**
+ * `main` holds the base commit. The `feature` branch commits an edit to `committed.js`, then
+ * leaves an unstaged edit, a staged edit, and an untracked file in the working tree.
+ */
+async function repo(settings?: Record<string, unknown>) {
   const project = await scratchProject('changed');
   project.write({
-    '.oxlintrc.json': JSON.stringify({
-      jsPlugins: [pluginPath],
-      rules: { 'jev/ask': ['error', { rules: [callRule, fileRule], ...options }] },
-    }),
+    '.oxlintrc.json': config(settings),
     '.gitignore': 'node_modules\n',
+    'committed.js': twoCalls('zero', 'nine'),
     'edited.js': twoCalls('one', 'two'),
     'staged.js': twoCalls('three', 'four'),
     'clean.js': twoCalls('five', 'six'),
   });
-  git(project.cwd, 'init', '-q');
+  git(project.cwd, 'init', '-q', '-b', 'main');
   git(project.cwd, 'add', '.');
   commit(project.cwd, 'base');
+  git(project.cwd, 'checkout', '-q', '-b', 'feature');
+  project.write({ 'committed.js': twoCalls('zero committed', 'nine') });
+  git(project.cwd, 'add', 'committed.js');
+  commit(project.cwd, 'on the branch');
   project.write({
     'edited.js': twoCalls('one', 'two edited'),
     'staged.js': twoCalls('three staged', 'four'),
@@ -60,13 +77,13 @@ async function repo(options: Record<string, unknown>) {
   return project;
 }
 
-const files = ['edited.js', 'staged.js', 'clean.js', 'untracked.js'];
+const files = ['committed.js', 'edited.js', 'staged.js', 'clean.js', 'untracked.js'];
 // A call snippet is one line; a file rule sends the whole file.
 const isFile = (snippet: string) => snippet.includes('\n');
 const callSnippets = (snippets: string[]) => snippets.filter((snippet) => !isFile(snippet)).sort();
 
-test('changedOnly asks only about matches on lines changed against HEAD', async () => {
-  const project = await repo({ changedOnly: true });
+test('"changed" is the default and asks only about lines changed since the merge base with main', async () => {
+  const project = await repo();
   const result = project.lint(files);
   expect(result.status, result.stdout + result.stderr).toBe(1);
   const snippets = snippetsOf(project.requests());
@@ -75,33 +92,86 @@ test('changedOnly asks only about matches on lines changed against HEAD', async 
     'console.log("seven", user.email, user.phone)',
     'console.log("three staged", user.email, user.phone)',
     'console.log("two edited", user.email, user.phone)',
+    'console.log("zero committed", user.email, user.phone)',
   ]);
   expect(
     project.requests().length,
     'the unchanged file sends nothing at all, its file rule included',
-  ).toBe(3);
-  expect(snippets.filter(isFile).length, 'a file rule matches every changed file').toBe(3);
+  ).toBe(4);
+  expect(snippets.filter(isFile).length, 'a file rule matches every changed file').toBe(4);
   expect(result.jev.some((line) => line.startsWith('clean.js'))).toBe(false);
+  expect(result.stderr).not.toContain('checking every line');
 });
 
-test('changedOnly is off by default and JEV_CHANGED_ONLY turns it on', async () => {
-  const project = await repo({});
+test('a rule set to "all" in settings asks about every match', async () => {
+  const project = await repo({ rules: { 'jev/ask': 'all' } });
   project.lint(files);
-  expect(callSnippets(snippetsOf(project.requests())).length, 'every call is asked about').toBe(8);
-
-  const scoped = await repo({});
-  scoped.lint(files, { JEV_CHANGED_ONLY: '1' });
-  expect(callSnippets(snippetsOf(scoped.requests())).length).toBe(4);
+  expect(callSnippets(snippetsOf(project.requests())).length).toBe(10);
 });
 
-test('changedBase and JEV_CHANGED_BASE pick the ref to diff against', async () => {
-  const project = await repo({ changedOnly: true, changedBase: 'HEAD' });
+test('the base setting and JEV_CHANGED_BASE pick the ref to diff against', async () => {
+  const project = await repo({ base: 'HEAD' });
+  project.lint(files);
+  expect(
+    callSnippets(snippetsOf(project.requests())),
+    'against HEAD, the commit on the branch no longer counts',
+  ).toHaveLength(4);
+
+  const fromEnv = await repo();
+  fromEnv.lint(files, { JEV_CHANGED_BASE: 'HEAD' });
+  expect(callSnippets(snippetsOf(fromEnv.requests()))).toHaveLength(4);
+});
+
+test('outside a git repository every line is checked, with a warning', async () => {
+  const project = await scratchProject('changed-nogit');
+  project.write({ '.oxlintrc.json': config(), 'a.js': twoCalls('one', 'two') });
+  const result = project.lint(['a.js']);
+  expect(callSnippets(snippetsOf(project.requests()))).toHaveLength(2);
+  expect(result.stderr).toMatch(/could not diff .*checking every line/);
+});
+
+test('without a default branch every line is checked, with a warning', async () => {
+  const project = await scratchProject('changed-trunk');
+  project.write({ '.oxlintrc.json': config(), 'a.js': twoCalls('one', 'two') });
+  git(project.cwd, 'init', '-q', '-b', 'trunk');
   git(project.cwd, 'add', '.');
-  commit(project.cwd, 'second');
-  project.lint(files);
-  expect(project.requests(), 'nothing changed against the new HEAD').toEqual([]);
-  project.lint(files, { JEV_CHANGED_BASE: 'HEAD~1' });
-  expect(callSnippets(snippetsOf(project.requests())).length).toBe(4);
+  commit(project.cwd, 'base');
+  const result = project.lint(['a.js']);
+  expect(callSnippets(snippetsOf(project.requests()))).toHaveLength(2);
+  expect(result.stderr).toMatch(/no default branch found/);
+});
+
+function bareRepo(branch: string) {
+  const cwd = mkdtempSync(path.join(tmpdir(), 'jev-base-'));
+  git(cwd, 'init', '-q', '-b', branch);
+  commit(cwd, 'base', '--allow-empty');
+  return cwd;
+}
+
+test('the default branch is origin/HEAD, then origin/main, origin/master, main, master', () => {
+  const master = bareRepo('master');
+  expect(defaultBase(master)).toBe('master');
+
+  git(master, 'branch', 'main');
+  expect(defaultBase(master), 'main is tried before master').toBe('main');
+
+  git(master, 'update-ref', 'refs/remotes/origin/master', 'HEAD');
+  expect(defaultBase(master), 'remote branches come before local ones').toBe('origin/master');
+
+  git(master, 'update-ref', 'refs/remotes/origin/main', 'HEAD');
+  git(master, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/master');
+  expect(defaultBase(master), 'origin/HEAD names the remote default branch').toBe('origin/master');
+
+  const none = bareRepo('trunk');
+  expect(defaultBase(none)).toBeNull();
+});
+
+test('ruleMode reads settings.changedLines.rules and falls back otherwise', () => {
+  const settings = { changedLines: { rules: { 'a/b': 'all', 'a/c': 'changed', 'a/d': 'bogus' } } };
+  expect(ruleMode(settings, 'a/b', 'changed')).toBe('all');
+  expect(ruleMode(settings, 'a/c', 'all')).toBe('changed');
+  expect(ruleMode(settings, 'a/d', 'all')).toBe('all');
+  expect(ruleMode({}, 'a/b', 'changed')).toBe('changed');
 });
 
 test('parses zero-context hunks into new-side line numbers', () => {

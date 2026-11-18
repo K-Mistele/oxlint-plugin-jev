@@ -11,7 +11,7 @@ import type {
 import { answerAll, type AnswersResult } from './answers.ts';
 import { backendFor } from './backend.ts';
 import { defaultCacheDir } from './cache.ts';
-import { changedLines, changedMode, overlaps, type ChangedLines } from './changed.ts';
+import { changedLines, overlaps, ruleMode, settingsBase, type ChangedLines } from './changed.ts';
 import {
   locates,
   locationAsk,
@@ -111,7 +111,8 @@ interface Pass {
   readonly options: ResolvedOptions;
   readonly backend: Backend;
   readonly backendId: string;
-  readonly changed: ChangedLines | null;
+  /** The file's changed lines, computed on first use by a rule in `"changed"` mode. */
+  readonly changedLines: () => ChangedLines;
   readonly matches: Match[];
   dropped: number;
   outcome: AnswersResult | null;
@@ -153,20 +154,17 @@ function startPass(context: Context, member: Member): Pass | 'skip' {
     warnOnce(`missing-key:${chosen.reason}`, `${chosen.reason}, skipping Jev checks`);
     return 'skip';
   }
-  let changed: ChangedLines | null = null;
-  const mode = changedMode(options);
-  if (mode.on) {
-    changed = changedLines(context.filename, mode.base, (message) =>
-      warnOnce(`changed:${message}`, message),
-    );
-    if (changed !== 'all' && changed.size === 0) return 'skip';
-  }
+  const base = settingsBase(context.settings);
+  let changed: ChangedLines | undefined;
   return {
     filename: context.filename,
     options,
     backend: chosen.backend,
     backendId: chosen.id,
-    changed,
+    changedLines: () =>
+      (changed ??= changedLines(context.filename, base, (message) =>
+        warnOnce(`changed:${message}`, message),
+      )),
     matches: [],
     dropped: 0,
     outcome: null,
@@ -294,11 +292,16 @@ function visitorsFor(
     if (pass === null) return;
     const rules = nodeTypeIndex(member.rules(pass.options)).get(type);
     if (rules === undefined) return;
+    // Jev rules default to "changed": every match is a paid request.
+    const lines =
+      ruleMode(context.settings, context.id, 'changed') === 'changed' ? pass.changedLines() : 'all';
+    // A file rule in an unchanged file sends nothing either.
+    if (lines !== 'all' && lines.size === 0) return;
     for (const rule of rules) {
       if (
-        pass.changed !== null &&
+        lines !== 'all' &&
         rule.target !== 'file' &&
-        !overlaps(pass.changed, node.loc.start.line, node.loc.end.line)
+        !overlaps(lines, node.loc.start.line, node.loc.end.line)
       ) {
         continue;
       }
