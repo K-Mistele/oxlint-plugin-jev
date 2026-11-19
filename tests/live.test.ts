@@ -1,22 +1,23 @@
 import { spawnSync } from 'node:child_process';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from 'vite-plus/test';
+import { backendFor } from '../src/backend.ts';
+import { checkOptions, DEFAULTS } from '../src/options.ts';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const cacheDir = path.join(root, 'node_modules', '.cache', 'oxlint-plugin-jev');
 const RULE_IDS = ['name-matches-behavior', 'no-pii-in-logs', 'no-prompt-injection'];
 
-const skip =
-  process.env.JEV_LIVE !== '1'
-    ? 'set JEV_LIVE=1 to lint example/ against the real API'
-    : (process.env.TYPESAFE_API_KEY ?? '').trim() === '' &&
-        (process.env.FACTORY_API_KEY ?? '').trim() === ''
-      ? 'neither TYPESAFE_API_KEY nor FACTORY_API_KEY is set'
-      : false;
+// The example's own options go through the plugin's backend selection, so this test runs exactly
+// when linting example/ would reach a real decision model.
+const exampleConfig = JSON.parse(
+  readFileSync(path.join(root, 'example', '.oxlintrc.json'), 'utf8'),
+) as { rules: { 'jev/ask': [string, object] } };
+const chosen = backendFor(checkOptions({ ...DEFAULTS, ...exampleConfig.rules['jev/ask'][1] }));
 
-test.skipIf(skip !== false)(
+test.skipIf(!chosen.ok)(
   'the example produces exactly the documented diagnostics against the real API',
   () => {
     rmSync(cacheDir, { recursive: true, force: true });
